@@ -18,9 +18,11 @@ public class FaceReceiver : MonoBehaviour
     private Vector3 latestPosition;
     private Quaternion latestRotation;
     private bool hasNewData = false;
-    
-    private List<FaceData> recordedData = new List<FaceData>();
+
+    private List<ExportData> recordedData = new List<ExportData>();
     private bool isRecording = false;
+    
+    public bool IsRecording => isRecording;
     
     void Start()
     {
@@ -46,15 +48,8 @@ public class FaceReceiver : MonoBehaviour
                 byte[] data = udpClient.Receive(ref endpoint);
                 string message = Encoding.UTF8.GetString(data);
                 
-                // Parse JSON from iOS app
                 PoseData pose = JsonUtility.FromJson<PoseData>(message);
-                
-                // ARKit coordinate system to Unity conversion
-                // ARKit: +X right, +Y up, +Z backward (right-handed)
-                // Unity: +X right, +Y up, +Z forward (left-handed)
                 latestPosition = new Vector3(pose.x, pose.y, -pose.z);
-                
-                // Convert quaternion: negate Z and W for coordinate system change
                 latestRotation = new Quaternion(pose.qx, pose.qy, -pose.qz, -pose.qw);
                 
                 hasNewData = true;
@@ -76,16 +71,17 @@ public class FaceReceiver : MonoBehaviour
             
             if (isRecording)
             {
-                recordedData.Add(new FaceData
+                Vector3 finalPos = latestPosition + positionOffset;
+                recordedData.Add(new ExportData
                 {
                     timestamp = Time.time,
-                    position = latestPosition + positionOffset,
-                    rotation = (latestRotation * Quaternion.Euler(rotationOffset)).eulerAngles
+                    x = finalPos.x,
+                    y = finalPos.y,
+                    z = finalPos.z
                 });
             }
         }
         
-        // Press R to toggle recording
         if (Input.GetKeyDown(KeyCode.R))
         {
             isRecording = !isRecording;
@@ -97,7 +93,6 @@ public class FaceReceiver : MonoBehaviour
             }
         }
         
-        // Press O to update position offset
         if (Input.GetKeyDown(KeyCode.O))
         {
             if (faceMarker != null)
@@ -110,9 +105,29 @@ public class FaceReceiver : MonoBehaviour
     
     void SaveData()
     {
-        string json = JsonUtility.ToJson(new FaceDataWrapper { data = recordedData }, true);
-        string path = $"Assets/face_data_{System.DateTime.Now:yyyyMMdd_HHmmss}.json";
-        File.WriteAllText(path, json);
+        StringBuilder json = new StringBuilder();
+        json.Append("[\n");
+    
+        for (int i = 0; i < recordedData.Count; i++)
+        {
+            var d = recordedData[i];
+            json.Append($"  {{\"timestamp\": {d.timestamp}, \"x\": {d.x}, \"y\": {d.y}, \"z\": {d.z}}}");
+            if (i < recordedData.Count - 1) json.Append(",");
+            json.Append("\n");
+        }
+    
+        json.Append("]");
+    
+        string folder = "Assets/";
+        if (!Directory.Exists(folder))
+        {
+            Directory.CreateDirectory(folder);
+        }
+    
+        string filename = $"human_data_{System.DateTime.Now:yyyyMMdd_HHmmss}.json";
+        string path = Path.Combine(folder, filename);
+    
+        File.WriteAllText(path, json.ToString());
         Debug.Log($"Saved {recordedData.Count} points to {path}");
         recordedData.Clear();
     }
@@ -124,7 +139,6 @@ public class FaceReceiver : MonoBehaviour
     }
 }
 
-// JSON structure from iOS app
 [System.Serializable]
 public struct PoseData
 {
@@ -138,15 +152,10 @@ public struct PoseData
 }
 
 [System.Serializable]
-public struct FaceData
+public struct ExportData
 {
     public float timestamp;
-    public Vector3 position;
-    public Vector3 rotation;
-}
-
-[System.Serializable]
-public class FaceDataWrapper
-{
-    public List<FaceData> data;
+    public float x;
+    public float y;
+    public float z;
 }
