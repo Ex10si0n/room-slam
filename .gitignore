@@ -122,3 +122,6 @@ out/
 *.mov
 *.avi
 /collector/Assets/Tutorials/Media/
+
+
+/visualization/img
