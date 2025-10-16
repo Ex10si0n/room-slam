@@ -115,3 +115,10 @@ out/
 *.code-workspace
 /collector/Library/
 /collector/Logs/
+
+# Large media files that cause push issues
+*.webm
+*.mp4
+*.mov
+*.avi
+/collector/Assets/Tutorials/Media/
