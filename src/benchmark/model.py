@@ -69,29 +69,37 @@ class TraceEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        # traces: [B, N, 4]
-        # mask: [B, N] - True for valid positions
+        """
+        Args:
+            traces: [B, N, 4] with (x,y,z,t)
+            mask:   [B, N] boolean; True means valid token
 
-        # Project input
+        Returns:
+            encoded: [B, N, D] transformer features
+            coords:  [B, N, 3] raw (x,y,z) coordinates (not encoded)
+        """
+        # Keep raw coordinates for anchor computation
+        coords = traces[..., :3].contiguous()  # [B, N, 3]
+
+        # Project input to model dimension
         x = self.input_proj(traces)  # [B, N, D]
 
         # Add positional encoding
         x = self.pos_encoding(x)
 
-        # Create attention mask (inverted for transformer)
-        if mask is not None:
-            attn_mask = ~mask  # [B, N] - True means ignore
-        else:
-            attn_mask = None
+        # Create attention mask (True -> ignore)
+        attn_mask = ~mask if mask is not None else None
 
-        # Encode
-        encoded = self.transformer(x, src_key_padding_mask=attn_mask)
+        # Encode traces
+        encoded = self.transformer(x, src_key_padding_mask=attn_mask)  # [B,N,D]
 
-        return encoded
-
+        return encoded, coords
 
 class ColliderDecoder(nn.Module):
-    """Decode colliders using learnable queries (DETR-style)"""
+    """
+    Decode colliders using learnable queries (DETR-style), predicting boxes
+    relative to attention-weighted anchors on the input trace coordinates.
+    """
 
     def __init__(self, d_model: int = 128, nhead: int = 4,
                  num_layers: int = 3, num_queries: int = 30):
@@ -112,37 +120,80 @@ class ColliderDecoder(nn.Module):
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers)
 
-        # Prediction heads
-        self.box_head = MLP(d_model, d_model, 6, 2)  # cx,cy,cz,sx,sy,sz
-        self.class_head = nn.Linear(d_model, 4)  # BLOCK/LOW/MID/HIGH
+        # Heads:
+        # - delta for center offset relative to the anchor
+        # - size logit will be passed through softplus to ensure positive sizes
+        self.center_delta_head = MLP(d_model, d_model, 3, 2)  # Δcx, Δcy, Δcz
+        self.size_head = MLP(d_model, d_model, 3, 2)          # raw logits -> softplus
+        self.class_head = nn.Linear(d_model, 4)               # BLOCK/LOW/MID/HIGH
 
-    def forward(self, memory: torch.Tensor, memory_mask: Optional[torch.Tensor] = None):
-        # memory: [B, N, D] - encoded traces
-        # memory_mask: [B, N]
+        # Lightweight attention projections for anchor computation
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.scale = d_model ** 0.5  # for dot-product attention scaling
 
-        B = memory.shape[0]
+    def forward(
+        self,
+        memory: torch.Tensor,               # [B, N, D] encoded features
+        coords: torch.Tensor,               # [B, N, 3] raw (x,y,z) of traces
+        memory_mask: Optional[torch.Tensor] = None  # [B, N] True for valid
+    ):
+        """
+        Returns:
+            boxes:   [B, Q, 6] absolute boxes (cx,cy,cz,sx,sy,sz)
+            classes: [B, Q, 4] class logits
+        """
+        B, N, D = memory.shape
 
-        # Get queries
+        # Prepare queries
         queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, Q, D]
 
-        # Decode
-        if memory_mask is not None:
-            mem_mask = ~memory_mask
-        else:
-            mem_mask = None
+        # Key padding mask for transformer: True means to ignore
+        mem_pad_mask = ~memory_mask if memory_mask is not None else None
 
+        # Decode query features with cross-attention over the memory
         decoded = self.transformer(
             queries,
             memory,
-            memory_key_padding_mask=mem_mask
+            memory_key_padding_mask=mem_pad_mask
         )  # [B, Q, D]
 
-        # Predict boxes and classes
-        boxes = self.box_head(decoded)  # [B, Q, 6]
-        classes = self.class_head(decoded)  # [B, Q, 4]
+        # ---------- Anchor attention over raw coordinates ----------
+        # Compute attention weights from decoded queries to memory tokens.
+        # We do a simple dot-product attention with separate projections.
+        q = self.q_proj(decoded)                 # [B, Q, D]
+        k = self.k_proj(memory)                  # [B, N, D]
+        attn_scores = torch.einsum('bqd,bnd->bqn', q, k) / self.scale  # [B, Q, N]
+
+        if memory_mask is not None:
+            # Mask out padded positions: set them to a very negative value
+            # memory_mask: True for valid -> we want False for padded, so invert:
+            pad = ~memory_mask  # True where padded
+            attn_scores = attn_scores.masked_fill(pad.unsqueeze(1), float('-inf'))
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, Q, N]
+
+        # Anchor position is the attention-weighted average of raw coords
+        # coords: [B, N, 3], attn: [B, Q, N] -> anchor: [B, Q, 3]
+        anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, coords)
+
+        # ---------- Predict relative centers and sizes ----------
+        delta_center = self.center_delta_head(decoded)       # [B, Q, 3]
+        size_raw = self.size_head(decoded)                   # [B, Q, 3]
+
+        # Absolute center = anchor + delta
+        center = anchor_pos + delta_center                   # [B, Q, 3]
+
+        # Positive sizes via softplus; add epsilon to avoid zeros
+        size = torch.nn.functional.softplus(size_raw) + 1e-4 # [B, Q, 3]
+
+        # Pack boxes: (cx,cy,cz,sx,sy,sz)
+        boxes = torch.cat([center, size], dim=-1)            # [B, Q, 6]
+
+        # Class logits from decoded features
+        classes = self.class_head(decoded)                   # [B, Q, 4]
 
         return boxes, classes
-
 
 class MLP(nn.Module):
     """Simple MLP"""
@@ -166,7 +217,7 @@ class MLP(nn.Module):
 
 
 class TraceToColliderTransformer(nn.Module):
-    """Complete model: Trace -> Colliders (Lightweight version for M4 24GB)"""
+    """Complete model: Trace -> Colliders (relative centers to anchors)"""
 
     def __init__(self, d_model: int = 128, nhead: int = 4,
                  num_encoder_layers: int = 3, num_decoder_layers: int = 3,
@@ -187,17 +238,16 @@ class TraceToColliderTransformer(nn.Module):
         )
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        # Encode traces
-        encoded = self.encoder(traces, mask)
+        # Encode traces -> features and raw coordinates
+        memory, coords = self.encoder(traces, mask)  # memory:[B,N,D], coords:[B,N,3]
 
-        # Decode colliders
-        boxes, classes = self.decoder(encoded, mask)
+        # Decode colliders with anchor-relative prediction
+        boxes, classes = self.decoder(memory, coords, mask)
 
         return {
-            'pred_boxes': boxes,  # [B, Q, 6]
-            'pred_classes': classes  # [B, Q, 4]
+            'pred_boxes': boxes,     # [B, Q, 6] absolute boxes
+            'pred_classes': classes  # [B, Q, 4] class logits
         }
-
 
 def build_model(num_queries: int = 30, d_model: int = 128):
     """
