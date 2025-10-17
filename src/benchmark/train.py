@@ -449,7 +449,11 @@ def main():
             return 0.5 * (1 + np.cos(np.pi * (epoch - config['warmup_epochs']) /
                                      (config['num_epochs'] - config['warmup_epochs'])))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min', factor=0.5, patience=5,
+        threshold=1e-3, cooldown=1, min_lr=1e-6, verbose=True
+    )
 
     # Training loop
     best_val_loss = float('inf')
@@ -460,19 +464,18 @@ def main():
             model, train_loader, criterion, optimizer, device, epoch
         )
 
-        # LR schedule step
-        scheduler.step()
-        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, LR = {scheduler.get_last_lr()[0]:.6f}")
-
-        # Validate
+        # === Validate ===
         if (epoch + 1) % config['val_every'] == 0:
             val_loss = validate(model, val_loader, criterion, device)
             metrics = evaluate_metrics(model, val_loader, device, iou_thresh=config['iou_thresh'])
 
-            print(f"[Val @ Epoch {epoch}] loss={val_loss:.4f} "
+            # 用验证损失驱动 scheduler（ReduceLROnPlateau 的用法）
+            scheduler.step(val_loss)
+
+            print(f"Epoch {epoch}: Train {train_loss:.4f} | Val {val_loss:.4f} | "
                   f"mIoU={metrics['mIoU']:.3f} "
                   f"P={metrics['precision']:.3f} R={metrics['recall']:.3f} F1={metrics['f1']:.3f} "
-                  f"ClsAcc={metrics['cls_acc']:.3f}  (tp={metrics['tp']}, fp={metrics['fp']}, fn={metrics['fn']})")
+                  f"ClsAcc={metrics['cls_acc']:.3f} | LR={optimizer.param_groups[0]['lr']:.6f}")
 
             # Save best on validation loss
             if val_loss < best_val_loss:
@@ -487,6 +490,11 @@ def main():
                 }, Path(config['save_dir']) / 'best_model.pth')
                 print(f"✓ Saved BEST model (val_loss={best_val_loss:.4f})")
 
+        else:
+            # 没有验证时也要更新打印 LR
+            print(f"Epoch {epoch}: Train {train_loss:.4f} | "
+                  f"LR={optimizer.param_groups[0]['lr']:.6f} (no val this epoch)")
+
         # Regular checkpoint
         if (epoch + 1) % 10 == 0:
             torch.save({
@@ -497,7 +505,6 @@ def main():
             }, Path(config['save_dir']) / f'checkpoint_epoch_{epoch}.pth')
 
     print("Training completed!")
-
 
 if __name__ == "__main__":
     main()
