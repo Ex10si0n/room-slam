@@ -52,8 +52,7 @@ class TraceEncoder(nn.Module):
                  num_layers: int = 3, dim_feedforward: int = 512):
         super().__init__()
 
-        # Input projection: (x,y,z,t) -> d_model
-        self.input_proj = nn.Linear(4, d_model)
+        self.input_proj = nn.Linear(11, d_model)
 
         # Positional encoding
         self.pos_encoding = PositionalEncoding(d_model)
@@ -79,21 +78,25 @@ class TraceEncoder(nn.Module):
             coords:  [B, N, 3] raw (x,y,z) coordinates (not encoded)
         """
         # Keep raw coordinates for anchor computation
-        coords = traces[..., :3].contiguous()  # [B, N, 3]
+        coords = traces[..., :3].contiguous()  # [B,N,3] raw xyz
+        valid = mask if mask is not None else torch.ones(traces.size()[:2], dtype=torch.bool, device=traces.device)
 
-        # Project input to model dimension
-        x = self.input_proj(traces)  # [B, N, D]
+        # mean over valid points
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)  # [B,1,1]
+        mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,3]
 
-        # Add positional encoding
+        # robust scale: RMS of centered coords in x,z (y可选)
+        centered = (coords - mean) * valid.unsqueeze(-1)
+        rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
+        scale = rms  # scalar per batch (use x,z energy)
+
+        x = self.input_proj(traces)  # [B,N,D]
         x = self.pos_encoding(x)
-
-        # Create attention mask (True -> ignore)
         attn_mask = ~mask if mask is not None else None
+        encoded = self.transformer(x, src_key_padding_mask=attn_mask)
 
-        # Encode traces
-        encoded = self.transformer(x, src_key_padding_mask=attn_mask)  # [B,N,D]
+        return encoded, coords, mean, scale
 
-        return encoded, coords
 
 class ColliderDecoder(nn.Module):
     """
@@ -124,8 +127,8 @@ class ColliderDecoder(nn.Module):
         # - delta for center offset relative to the anchor
         # - size logit will be passed through softplus to ensure positive sizes
         self.center_delta_head = MLP(d_model, d_model, 3, 2)  # Δcx, Δcy, Δcz
-        self.size_head = MLP(d_model, d_model, 3, 2)          # raw logits -> softplus
-        self.class_head = nn.Linear(d_model, 4)               # BLOCK/LOW/MID/HIGH
+        self.size_head = MLP(d_model, d_model, 3, 2)  # raw logits -> softplus
+        self.class_head = nn.Linear(d_model, 4)  # BLOCK/LOW/MID/HIGH
 
         # Lightweight attention projections for anchor computation
         self.q_proj = nn.Linear(d_model, d_model)
@@ -133,10 +136,12 @@ class ColliderDecoder(nn.Module):
         self.scale = d_model ** 0.5  # for dot-product attention scaling
 
     def forward(
-        self,
-        memory: torch.Tensor,               # [B, N, D] encoded features
-        coords: torch.Tensor,               # [B, N, 3] raw (x,y,z) of traces
-        memory_mask: Optional[torch.Tensor] = None  # [B, N] True for valid
+            self,
+            memory: torch.Tensor,  # [B, N, D] encoded features
+            coords: torch.Tensor,  # [B, N, 3] raw (x,y,z) of traces
+            mean: torch.Tensor,  # [B, 1, 3] mean of valid coords
+            scale: torch.Tensor,  # [B, 1, 1] scale of
+            memory_mask: Optional[torch.Tensor] = None  # [B, N] True for valid
     ):
         """
         Returns:
@@ -161,8 +166,8 @@ class ColliderDecoder(nn.Module):
         # ---------- Anchor attention over raw coordinates ----------
         # Compute attention weights from decoded queries to memory tokens.
         # We do a simple dot-product attention with separate projections.
-        q = self.q_proj(decoded)                 # [B, Q, D]
-        k = self.k_proj(memory)                  # [B, N, D]
+        q = self.q_proj(decoded)  # [B, Q, D]
+        k = self.k_proj(memory)  # [B, N, D]
         attn_scores = torch.einsum('bqd,bnd->bqn', q, k) / self.scale  # [B, Q, N]
 
         if memory_mask is not None:
@@ -171,29 +176,28 @@ class ColliderDecoder(nn.Module):
             pad = ~memory_mask  # True where padded
             attn_scores = attn_scores.masked_fill(pad.unsqueeze(1), float('-inf'))
 
+        # normalize coords to canonical space
+        norm_coords = (coords - mean) / scale  # [B,N,3]
+
         attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, Q, N]
 
         # Anchor position is the attention-weighted average of raw coords
-        # coords: [B, N, 3], attn: [B, Q, N] -> anchor: [B, Q, 3]
-        anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, coords)
+        anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, norm_coords)  # [B,Q,3]
 
-        # ---------- Predict relative centers and sizes ----------
-        delta_center = self.center_delta_head(decoded)       # [B, Q, 3]
-        size_raw = self.size_head(decoded)                   # [B, Q, 3]
+        # relative predictions in normalized space
+        delta_center = self.center_delta_head(decoded)  # [B,Q,3]
+        size_raw = self.size_head(decoded)  # [B,Q,3]
+        size_norm = torch.nn.functional.softplus(size_raw) + 1e-4
 
-        # Absolute center = anchor + delta
-        center = anchor_pos + delta_center                   # [B, Q, 3]
+        # denormalize back to absolute
+        center = anchor_pos + delta_center  # normalized
+        center = center * scale + mean  # absolute
+        size = size_norm * scale  # absolute (isotropic scale;也可只乘x,z)
 
-        # Positive sizes via softplus; add epsilon to avoid zeros
-        size = torch.nn.functional.softplus(size_raw) + 1e-4 # [B, Q, 3]
-
-        # Pack boxes: (cx,cy,cz,sx,sy,sz)
-        boxes = torch.cat([center, size], dim=-1)            # [B, Q, 6]
-
-        # Class logits from decoded features
-        classes = self.class_head(decoded)                   # [B, Q, 4]
-
+        boxes = torch.cat([center, size], dim=-1)
+        classes = self.class_head(decoded)
         return boxes, classes
+
 
 class MLP(nn.Module):
     """Simple MLP"""
@@ -239,17 +243,18 @@ class TraceToColliderTransformer(nn.Module):
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
         # Encode traces -> features and raw coordinates
-        memory, coords = self.encoder(traces, mask)  # memory:[B,N,D], coords:[B,N,3]
+        memory, coords, mean, scale = self.encoder(traces, mask)  # memory:[B,N,D], coords:[B,N,3]
 
         # Decode colliders with anchor-relative prediction
-        boxes, classes = self.decoder(memory, coords, mask)
+        boxes, classes = self.decoder(memory, coords, mean, scale, mask)
 
         return {
-            'pred_boxes': boxes,     # [B, Q, 6] absolute boxes
+            'pred_boxes': boxes,  # [B, Q, 6] absolute boxes
             'pred_classes': classes  # [B, Q, 4] class logits
         }
 
-def build_model(num_queries: int = 60, d_model: int = 256):
+
+def build_model(num_queries: int = 80, d_model: int = 256):
     """
     Build a larger model for higher capacity.
 

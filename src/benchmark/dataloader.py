@@ -354,6 +354,39 @@ class TraceColliderDataset(Dataset):
             traces = self._scale_traces(traces, scale)
             colliders = self._scale_colliders(colliders, scale)
 
+        # after rotation/translation/scale
+        if np.random.rand() < 0.5:
+            # reverse sequence (both traces and timestamps)
+            traces = list(reversed(traces))
+
+        # small gaussian noise on positions
+        if np.random.rand() < 0.8:
+            for p in traces:
+                p['x'] += np.random.normal(0, 0.02)
+                p['y'] += np.random.normal(0, 0.01)
+                p['z'] += np.random.normal(0, 0.02)
+
+        # subsequence crop
+        if len(traces) > 100 and np.random.rand() < 0.5:
+            start = np.random.randint(0, int(0.2 * len(traces)))
+            end = np.random.randint(int(0.8 * len(traces)), len(traces))
+            traces = traces[start:end]
+
+        # time-warping (piecewise scaling)
+        if np.random.rand() < 0.5:
+            t = np.array([p['timestamp'] for p in traces], dtype=np.float32)
+            t = t - t.min()
+            # 2-piece warp
+            k = np.random.uniform(0.4, 0.6)
+            s1, s2 = np.random.uniform(0.5, 1.5), np.random.uniform(0.5, 1.5)
+            t_max = t.max() + 1e-6
+            mask = (t / t_max < k)
+            t[mask] *= s1
+            t[~mask] = k * s1 + (t[~mask] - k * t_max) * s2
+            # write back
+            for i, p in enumerate(traces):
+                p['timestamp'] = float(t[i])
+
         # Apply collider dropout (simulates missing/partial observations)
         if self.augment_collider_dropout and np.random.rand() < 0.5:
             colliders = self._dropout_colliders(colliders, self.collider_dropout_prob)
@@ -376,16 +409,13 @@ class TraceColliderDataset(Dataset):
 
     def _process_traces(self, traces: List[Dict]) -> torch.Tensor:
         """
-        Convert trace list to tensor [N, 4] (x, y, z, t).
-
-        Args:
-            traces: List of dicts with keys 'x', 'y', 'z', 'timestamp'
-
-        Returns:
-            Tensor of shape [N, 4]
+        Convert trace list to tensor [N, 11] (x,y,z,t + 7 kinematic features).
         """
+        FEAT_DIM = 11  # (x,y,z,t) + (vx,vy,vz, ax,ay,az, speed)
+
         if len(traces) == 0:
-            return torch.zeros((1, 4), dtype=torch.float32)
+            # Return a single padded row matching the new feature dimension
+            return torch.zeros((1, FEAT_DIM), dtype=torch.float32)
 
         # Extract coordinates
         trace_list = []
@@ -399,9 +429,25 @@ class TraceColliderDataset(Dataset):
 
         trace_array = np.array(trace_list, dtype=np.float32)
 
-        # Normalize timestamp to start from 0
-        if trace_array.shape[0] > 0 and trace_array[:, 3].max() > 0:
-            trace_array[:, 3] -= trace_array[:, 3].min()
+        # Ensure strictly time-sorted (very important)
+        # sort by timestamp (col=3)
+        order = np.argsort(trace_array[:, 3])
+        trace_array = trace_array[order]
+
+        # normalize time to start at 0
+        if trace_array.shape[0] > 0:
+            trace_array[:, 3] -= trace_array[0, 3]
+
+        #  Kinematic features to enforce order sensitivity
+        # dx,dy,dz, dt, speed, ax,ay,az  (pad first row with zeros)
+        diffs = np.diff(trace_array, axis=0, prepend=trace_array[[0], :])
+        dt = np.clip(diffs[:, 3], 1e-3, None)
+        vel = diffs[:, :3] / dt[:, None]                   # [N,3]
+        acc = np.diff(vel, axis=0, prepend=vel[[0], :])    # [N,3]
+        speed = np.linalg.norm(vel, axis=1, keepdims=True) # [N,1]
+        kin = np.concatenate([vel, acc, speed], axis=1)    # [N,7]
+
+        trace_array = np.concatenate([trace_array, kin], axis=1)  # [N, 4+7=11]
 
         # Downsample if too long
         if len(trace_array) > self.max_trace_len:
@@ -472,46 +518,44 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     Returns:
         Batched tensors with proper padding
     """
-    # Find max trace length in batch
+    # Max time length in this batch
     max_len = max(item['traces'].shape[0] for item in batch)
 
-    # Pad traces
     traces_padded = []
     masks = []
 
     for item in batch:
-        trace = item['traces']  # [N, 4]
-        pad_len = max_len - len(trace)
+        trace = item['traces']  # [N, F]
+        feat_dim = trace.shape[1]  # dynamic feature dimension
+        pad_len = max_len - trace.shape[0]
 
         if pad_len > 0:
-            # Pad with zeros
+            # Pad to [max_len, F]
             trace = torch.cat([
                 trace,
-                torch.zeros((pad_len, 4), dtype=torch.float32)
+                torch.zeros((pad_len, feat_dim), dtype=torch.float32)
             ], dim=0)
 
-            # Create mask: True for valid positions, False for padding
+            # True for valid positions, False for padding
             mask = torch.cat([
-                torch.ones(len(item['traces']), dtype=torch.bool),
+                torch.ones(item['traces'].shape[0], dtype=torch.bool),
                 torch.zeros(pad_len, dtype=torch.bool)
             ])
         else:
-            mask = torch.ones(len(trace), dtype=torch.bool)
+            mask = torch.ones(trace.shape[0], dtype=torch.bool)
 
         traces_padded.append(trace)
         masks.append(mask)
 
-    # Stack everything
     batched = {
-        'traces': torch.stack(traces_padded),  # [B, N, 4]
+        'traces': torch.stack(traces_padded),  # [B, N, F]
         'trace_mask': torch.stack(masks),  # [B, N]
-        'boxes': torch.stack([item['boxes'] for item in batch]),  # [B, M, 6]
-        'labels': torch.stack([item['labels'] for item in batch]),  # [B, M]
-        'valid_mask': torch.stack([item['valid_mask'] for item in batch]),  # [B, M]
+        'boxes': torch.stack([item['boxes'] for item in batch]),
+        'labels': torch.stack([item['labels'] for item in batch]),
+        'valid_mask': torch.stack([item['valid_mask'] for item in batch]),
         'num_traces': torch.stack([item['num_traces'] for item in batch]),
         'num_colliders': torch.stack([item['num_colliders'] for item in batch]),
     }
-
     return batched
 
 
