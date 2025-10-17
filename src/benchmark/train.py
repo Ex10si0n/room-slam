@@ -452,7 +452,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min', factor=0.5, patience=5,
-        threshold=1e-3, cooldown=1, min_lr=1e-6, verbose=True
+        threshold=1e-3, cooldown=1, min_lr=1e-6
     )
 
     # Training loop
