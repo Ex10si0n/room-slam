@@ -32,7 +32,15 @@ def process_traces(traces):
     ], dtype=np.float32)
 
     # Normalize timestamp
-    trace_array[:, 3] -= trace_array[0, 3]
+    if trace_array.shape[0] > 0:
+        trace_array[:, 3] -= trace_array[:, 3].min()
+
+    # Downsample if too long (to avoid memory issues)
+    max_len = 3000
+    if len(trace_array) > max_len:
+        print(f"Downsampling traces from {len(trace_array)} to {max_len} points")
+        indices = np.linspace(0, len(trace_array) - 1, max_len, dtype=int)
+        trace_array = trace_array[indices]
 
     return torch.from_numpy(trace_array)
 
