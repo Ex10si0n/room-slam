@@ -198,8 +198,13 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
 
 
 def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=0.3):
-    """Run prediction on a trace file. Robust to different process_traces return signatures."""
+    """Run prediction on a trace file. Robust to process_traces signatures and model wrappers."""
     import numpy as np
+
+    # --- Normalize model: unwrap tuple/wrapper if needed ---
+    # e.g., model could be (model, config) or similar
+    if isinstance(model, tuple) and len(model) > 0 and hasattr(model[0], 'forward'):
+        model = model[0]
 
     # Load traces
     with open(traces_file, 'r') as f:
@@ -210,9 +215,8 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
         print("Warning: No traces found in file")
         return []
 
-    # --- Call process_traces with backward compatibility ---
+    # Build features (+ optional mask); be tolerant to different return arity
     out = process_traces(traces)
-    # out could be: tensor, (tensor, mask), or (tensor, mask, extra...)
     if isinstance(out, tuple):
         if len(out) >= 2:
             trace_tensor, mask = out[0], out[1]
@@ -225,54 +229,50 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
         trace_tensor = out
         mask = torch.ones(trace_tensor.shape[0], dtype=torch.bool)
 
-    # Ensure tensor types/shapes
+    # Ensure types
     if not isinstance(trace_tensor, torch.Tensor):
         trace_tensor = torch.as_tensor(trace_tensor, dtype=torch.float32)
     if not isinstance(mask, torch.Tensor):
         mask = torch.as_tensor(mask, dtype=torch.bool)
 
-    # Add batch dimension
+    # Add batch dim
     trace_tensor = trace_tensor.unsqueeze(0).to(device)  # [1, N, F]
     mask = mask.unsqueeze(0).to(device)                  # [1, N]
 
-    # --- Auto-adapt feature dim to the model (handles 4D->11D mismatch) ---
+    # --- Auto-adapt feature dim to encoder.input_proj.in_features (no modules() walk) ---
     in_feat = None
-    try:
-        in_feat = getattr(getattr(model, 'encoder', None).input_proj, 'in_features', None)
-    except Exception:
-        pass
-    if in_feat is None:
-        # Fallback: try to find the first Linear inside encoder
-        for m in model.modules():
-            if isinstance(m, torch.nn.Linear):
-                in_feat = m.in_features
-                break
+    enc = getattr(model, 'encoder', None)
+    if enc is not None:
+        ip = getattr(enc, 'input_proj', None)
+        if isinstance(ip, torch.nn.Linear):
+            in_feat = ip.in_features
 
-    cur_feat = trace_tensor.shape[-1]
-    if in_feat is not None and cur_feat != in_feat:
+    # If we know the expected feature dim, adapt by truncate/pad; otherwise leave as-is
+    if in_feat is not None and trace_tensor.shape[-1] != in_feat:
+        cur_feat = trace_tensor.shape[-1]
         if cur_feat > in_feat:
-            # Truncate extra features (e.g., drop kinematic features for old 4-D models)
             trace_tensor = trace_tensor[..., :in_feat]
         else:
-            # Pad with zeros if fewer features than model expects
             pad = torch.zeros(trace_tensor.size(0), trace_tensor.size(1), in_feat - cur_feat,
                               device=trace_tensor.device, dtype=trace_tensor.dtype)
             trace_tensor = torch.cat([trace_tensor, pad], dim=-1)
 
-    # --- Forward ---
+    # --- Forward (new API takes mask; fallback to legacy) ---
     with torch.no_grad():
         try:
-            outputs = model(trace_tensor, mask)  # new API (expects mask)
+            outputs = model(trace_tensor, mask)
         except TypeError:
-            outputs = model(trace_tensor)        # legacy API
+            outputs = model(trace_tensor)
 
     # --- Post-process with NMS ---
     pred_boxes = outputs['pred_boxes'][0]      # [Q, 6]
     pred_classes = outputs['pred_classes'][0]  # [Q, 4]
-    predictions = post_process_predictions(pred_boxes, pred_classes,
-                                           confidence_threshold, nms_threshold)
+    predictions = post_process_predictions(
+        pred_boxes, pred_classes,
+        confidence_threshold=confidence_threshold,
+        nms_threshold=nms_threshold
+    )
     return predictions
-
 
 def main():
     parser = argparse.ArgumentParser()
