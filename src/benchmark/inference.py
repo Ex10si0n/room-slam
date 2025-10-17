@@ -12,37 +12,49 @@ def load_model(checkpoint_path: str, device):
     config = checkpoint.get('config', {})
     model = build_model(
         num_queries=config.get('num_queries', 50),
-        d_model=config.get('d_model', 256)
+        d_model=config.get('d_model', 256),
+        model_type=config.get('model_type', 'lstm')
     )
 
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-
-    return model
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    model.to(device).eval()
+    return model, config
 
 
-def process_traces(traces):
-    """Convert trace list to tensor"""
+def process_traces(traces, max_len: int = 3000):
+    """Convert trace list to a [N,11] tensor:
+       [x,y,z,t, vx,vy,vz, ax,ay,az, speed]
+    """
     import numpy as np
 
-    trace_array = np.array([
-        [p['x'], p['y'], p['z'], p['timestamp']]
-        for p in traces
-    ], dtype=np.float32)
+    # raw array [N,4]
+    arr = np.array([[p['x'], p['y'], p['z'], p['timestamp']] for p in traces], dtype=np.float32)
 
-    # Normalize timestamp
-    if trace_array.shape[0] > 0:
-        trace_array[:, 3] -= trace_array[:, 3].min()
+    if arr.shape[0] == 0:
+        return torch.zeros((1, 11), dtype=torch.float32)
 
-    # Downsample if too long (to avoid memory issues)
-    max_len = 3000
-    if len(trace_array) > max_len:
-        print(f"Downsampling traces from {len(trace_array)} to {max_len} points")
-        indices = np.linspace(0, len(trace_array) - 1, max_len, dtype=int)
-        trace_array = trace_array[indices]
+    # sort by time & normalize time to start at 0
+    order = np.argsort(arr[:, 3])
+    arr = arr[order]
+    arr[:, 3] -= arr[0, 3]
 
-    return torch.from_numpy(trace_array)
+    # kinematic features (order-sensitive)
+    diffs = np.diff(arr, axis=0, prepend=arr[[0], :])
+    dt = np.clip(diffs[:, 3], 1e-3, None)
+    vel = diffs[:, :3] / dt[:, None]                    # [N,3]
+    acc = np.diff(vel, axis=0, prepend=vel[[0], :])     # [N,3]
+    speed = np.linalg.norm(vel, axis=1, keepdims=True)  # [N,1]
+    kin = np.concatenate([vel, acc, speed], axis=1)     # [N,7]
+
+    feats = np.concatenate([arr, kin], axis=1).astype(np.float32)  # [N,11]
+
+    # downsample to max_len
+    if feats.shape[0] > max_len:
+        print(f"Downsampling traces from {feats.shape[0]} to {max_len} points")
+        idx = np.linspace(0, feats.shape[0] - 1, max_len, dtype=int)
+        feats = feats[idx]
+
+    return torch.from_numpy(feats)  # [N,11]
 
 
 def compute_iou_3d(box1, box2):
@@ -186,39 +198,56 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
 
 
 def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=0.3):
-    """Run prediction on a trace file"""
-
+    """Run prediction on a trace file with 11-D features and pass mask to the model."""
     # Load traces
     with open(traces_file, 'r') as f:
         data = json.load(f)
 
-    # Handle both formats:
-    # 1. Direct list: [{x, y, z, timestamp}, ...]
-    # 2. Dict with traces: {"traces": [...]}
-    if isinstance(data, list):
-        traces = data
-    else:
-        traces = data.get('traces', data.get('trajectory', []))
-
+    traces = data if isinstance(data, list) else data.get('traces', data.get('trajectory', []))
     if len(traces) == 0:
         print("Warning: No traces found in file")
         return []
 
-    # Process traces
-    trace_tensor = process_traces(traces).unsqueeze(0).to(device)  # [1, N, 4]
+    # Build features and mask
+    trace_tensor, mask = process_traces(traces)             # [N,11], [N]
+    trace_tensor = trace_tensor.unsqueeze(0).to(device)     # [1,N,11]
+    mask = mask.unsqueeze(0).to(device)                     # [1,N]
 
-    # Run inference
+    # --- Safety: adapt to model's expected input feature dim (11 vs 4) ---
+    in_feat = None
+    try:
+        in_feat = getattr(getattr(model, 'encoder', None).input_proj, 'in_features', None)
+    except Exception:
+        pass
+    if in_feat is None:
+        # Fallback: try to infer from first Linear in the encoder
+        for m in model.modules():
+            if isinstance(m, torch.nn.Linear):
+                in_feat = m.in_features
+                break
+
+    if in_feat is not None and trace_tensor.shape[-1] != in_feat:
+        if trace_tensor.shape[-1] > in_feat:
+            # Truncate (use first in_feat columns, e.g., drop kinematic features for old 4-D models)
+            trace_tensor = trace_tensor[..., :in_feat]
+        else:
+            # Pad with zeros to match (rare)
+            pad = torch.zeros(trace_tensor.size(0), trace_tensor.size(1), in_feat - trace_tensor.size(-1),
+                              device=trace_tensor.device, dtype=trace_tensor.dtype)
+            trace_tensor = torch.cat([trace_tensor, pad], dim=-1)
+
+    # Forward (pass mask if the model supports it)
     with torch.no_grad():
-        outputs = model(trace_tensor)
+        try:
+            outputs = model(trace_tensor, mask)  # new models expect (traces, mask)
+        except TypeError:
+            outputs = model(trace_tensor)        # fallback for legacy signature
 
-    # Post-process with NMS
-    pred_boxes = outputs['pred_boxes'][0]  # [Q, 6]
-    pred_classes = outputs['pred_classes'][0]  # [Q, 4]
-
-    predictions = post_process_predictions(
-        pred_boxes, pred_classes, confidence_threshold, nms_threshold
-    )
-
+    # Post-process
+    pred_boxes = outputs['pred_boxes'][0]      # [Q,6]
+    pred_classes = outputs['pred_classes'][0]  # [Q,4]
+    predictions = post_process_predictions(pred_boxes, pred_classes,
+                                           confidence_threshold, nms_threshold)
     return predictions
 
 

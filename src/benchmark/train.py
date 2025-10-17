@@ -364,6 +364,7 @@ def main():
 
     # Hyperparameters (optimized for training)
     config = {
+        'model_type': 'lstm',
         'batch_size': 20,
         'num_epochs': 200,
         'lr': 2e-4,
@@ -420,7 +421,8 @@ def main():
     # Build model
     model = build_model(
         num_queries=config['num_queries'],
-        d_model=config['d_model']
+        d_model=config['d_model'],
+        model_type=config.get('model_type', 'transformer')
     ).to(device)
 
     # Count parameters
