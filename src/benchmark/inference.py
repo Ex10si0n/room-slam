@@ -139,7 +139,7 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
     valid_labels = pred_labels[valid_indices]
 
     # Apply NMS per class
-    keep_indices = []
+    final_indices = []
     for label_id in range(4):
         class_mask = valid_labels == label_id
         class_indices = class_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -150,18 +150,19 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
         class_boxes = valid_boxes[class_indices]
         class_scores = valid_scores[class_indices]
 
-        # NMS for this class
-        keep = nms_3d(class_boxes, class_scores, nms_threshold)
-        keep_indices.extend(class_indices[keep].tolist())
+        # NMS for this class (returns indices into class_boxes)
+        keep_in_class = nms_3d(class_boxes, class_scores, nms_threshold)
+
+        # Map back to valid_boxes indices
+        for k in keep_in_class:
+            final_indices.append(class_indices[k].item())
 
     # Format predictions
     predictions = []
-    for i in keep_indices:
-        box = valid_boxes[
-            valid_indices.tolist().index(i) if isinstance(valid_indices, torch.Tensor) else i].cpu().numpy()
-        label = label_map[
-            valid_labels[valid_indices.tolist().index(i) if isinstance(valid_indices, torch.Tensor) else i].item()]
-        conf = valid_scores[valid_indices.tolist().index(i) if isinstance(valid_indices, torch.Tensor) else i].item()
+    for idx in final_indices:
+        box = valid_boxes[idx].cpu().numpy()
+        label = label_map[valid_labels[idx].item()]
+        conf = valid_scores[idx].item()
 
         predictions.append({
             'type': 'BoxCollider',
