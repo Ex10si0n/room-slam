@@ -646,7 +646,7 @@ if __name__ == "__main__":
     import sys
 
     # Test dataloader
-    data_dir = "../../dataset"
+    data_dir = "../../dataset/train"
 
     if len(sys.argv) > 1:
         data_dir = sys.argv[1]
