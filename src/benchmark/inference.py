@@ -198,7 +198,9 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
 
 
 def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=0.3):
-    """Run prediction on a trace file with 11-D features and pass mask to the model."""
+    """Run prediction on a trace file. Robust to different process_traces return signatures."""
+    import numpy as np
+
     # Load traces
     with open(traces_file, 'r') as f:
         data = json.load(f)
@@ -208,44 +210,65 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
         print("Warning: No traces found in file")
         return []
 
-    # Build features and mask
-    trace_tensor, mask = process_traces(traces)             # [N,11], [N]
-    trace_tensor = trace_tensor.unsqueeze(0).to(device)     # [1,N,11]
-    mask = mask.unsqueeze(0).to(device)                     # [1,N]
+    # --- Call process_traces with backward compatibility ---
+    out = process_traces(traces)
+    # out could be: tensor, (tensor, mask), or (tensor, mask, extra...)
+    if isinstance(out, tuple):
+        if len(out) >= 2:
+            trace_tensor, mask = out[0], out[1]
+        elif len(out) == 1:
+            trace_tensor = out[0]
+            mask = torch.ones(trace_tensor.shape[0], dtype=torch.bool)
+        else:
+            raise ValueError("process_traces returned an empty tuple.")
+    else:
+        trace_tensor = out
+        mask = torch.ones(trace_tensor.shape[0], dtype=torch.bool)
 
-    # --- Safety: adapt to model's expected input feature dim (11 vs 4) ---
+    # Ensure tensor types/shapes
+    if not isinstance(trace_tensor, torch.Tensor):
+        trace_tensor = torch.as_tensor(trace_tensor, dtype=torch.float32)
+    if not isinstance(mask, torch.Tensor):
+        mask = torch.as_tensor(mask, dtype=torch.bool)
+
+    # Add batch dimension
+    trace_tensor = trace_tensor.unsqueeze(0).to(device)  # [1, N, F]
+    mask = mask.unsqueeze(0).to(device)                  # [1, N]
+
+    # --- Auto-adapt feature dim to the model (handles 4D->11D mismatch) ---
     in_feat = None
     try:
         in_feat = getattr(getattr(model, 'encoder', None).input_proj, 'in_features', None)
     except Exception:
         pass
     if in_feat is None:
-        # Fallback: try to infer from first Linear in the encoder
+        # Fallback: try to find the first Linear inside encoder
         for m in model.modules():
             if isinstance(m, torch.nn.Linear):
                 in_feat = m.in_features
                 break
 
-    if in_feat is not None and trace_tensor.shape[-1] != in_feat:
-        if trace_tensor.shape[-1] > in_feat:
-            # Truncate (use first in_feat columns, e.g., drop kinematic features for old 4-D models)
+    cur_feat = trace_tensor.shape[-1]
+    if in_feat is not None and cur_feat != in_feat:
+        if cur_feat > in_feat:
+            # Truncate extra features (e.g., drop kinematic features for old 4-D models)
             trace_tensor = trace_tensor[..., :in_feat]
         else:
-            # Pad with zeros to match (rare)
-            pad = torch.zeros(trace_tensor.size(0), trace_tensor.size(1), in_feat - trace_tensor.size(-1),
+            # Pad with zeros if fewer features than model expects
+            pad = torch.zeros(trace_tensor.size(0), trace_tensor.size(1), in_feat - cur_feat,
                               device=trace_tensor.device, dtype=trace_tensor.dtype)
             trace_tensor = torch.cat([trace_tensor, pad], dim=-1)
 
-    # Forward (pass mask if the model supports it)
+    # --- Forward ---
     with torch.no_grad():
         try:
-            outputs = model(trace_tensor, mask)  # new models expect (traces, mask)
+            outputs = model(trace_tensor, mask)  # new API (expects mask)
         except TypeError:
-            outputs = model(trace_tensor)        # fallback for legacy signature
+            outputs = model(trace_tensor)        # legacy API
 
-    # Post-process
-    pred_boxes = outputs['pred_boxes'][0]      # [Q,6]
-    pred_classes = outputs['pred_classes'][0]  # [Q,4]
+    # --- Post-process with NMS ---
+    pred_boxes = outputs['pred_boxes'][0]      # [Q, 6]
+    pred_classes = outputs['pred_classes'][0]  # [Q, 4]
     predictions = post_process_predictions(pred_boxes, pred_classes,
                                            confidence_threshold, nms_threshold)
     return predictions
