@@ -7,7 +7,7 @@ from model import build_model
 
 def load_model(checkpoint_path: str, device):
     """Load trained model"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     config = checkpoint.get('config', {})
     model = build_model(
