@@ -275,7 +275,7 @@ def main():
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,
-        'data_dir': '../../dataset',
+        'data_dir': '../../dataset/train',
         'save_dir': './checkpoints',
         'warmup_epochs': 10
     }
