@@ -8,7 +8,7 @@ import json
 from tqdm import tqdm
 
 from dataloader import create_dataloader
-from src.benchmark.model import build_model
+from model import build_model
 
 
 class HungarianMatcher:
