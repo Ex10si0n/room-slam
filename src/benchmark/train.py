@@ -111,7 +111,7 @@ class SetCriterion(nn.Module):
         pred_classes = outputs['pred_classes']
         gt_boxes = targets['boxes']
         gt_labels = targets['labels']
-        gt_valid_mask = targets['valid_mask']  # Use valid_mask from dataloader
+        gt_valid_mask = targets['valid_mask']
 
         # Hungarian matching
         indices = self.matcher.forward(pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask)
@@ -269,15 +269,15 @@ def main():
 
     # Hyperparameters (optimized for training)
     config = {
-        'batch_size': 4,  # Increased from 2 (GPU can handle more)
-        'num_epochs': 200,  # More epochs for better convergence
-        'lr': 2e-4,  # Slightly higher initial LR
+        'batch_size': 4,
+        'num_epochs': 200,
+        'lr': 2e-4,
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,
         'data_dir': '../../dataset',
         'save_dir': './checkpoints',
-        'warmup_epochs': 10  # Warmup for stable training
+        'warmup_epochs': 10
     }
 
     # Create save directory
