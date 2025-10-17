@@ -71,7 +71,7 @@ public class ColliderExporter : MonoBehaviour
             Directory.CreateDirectory(folder);
         }
     
-        string filename = $"colliders.json";
+        string filename = $"colliders1.json";
         string path = Path.Combine(folder, filename);
     
         File.WriteAllText(path, json.ToString());

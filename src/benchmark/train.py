@@ -231,6 +231,101 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
 
     return total_loss / len(dataloader)
 
+@torch.no_grad()
+def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
+    model.eval()
+    matcher = HungarianMatcher()
+    total_iou_sum = 0.0
+    total_iou_cnt = 0
+
+    tp = 0
+    fp = 0
+    fn = 0
+
+    cls_correct = 0
+    cls_total = 0
+
+    for batch in tqdm(dataloader, desc="Evaluating"):
+        traces = batch['traces'].to(device)
+        mask = batch['trace_mask'].to(device)
+        gt_boxes = batch['boxes'].to(device)
+        gt_labels = batch['labels'].to(device)
+        gt_valid_mask = batch['valid_mask'].to(device)
+
+        outputs = model(traces, mask)  # expects {'pred_boxes':[B,Q,6], 'pred_classes':[B,Q,4]}
+        pred_boxes = outputs['pred_boxes']
+        pred_logits = outputs['pred_classes']  # [B,Q,4]
+        pred_probs = pred_logits.softmax(-1)
+        pred_labels = pred_probs.argmax(-1)    # [B,Q]
+
+        # Hungarian matching for alignment
+        indices = matcher.forward(pred_boxes, pred_logits, gt_boxes, gt_labels, gt_valid_mask)
+
+        # Accumulate metrics per batch
+        B, Q = pred_boxes.shape[:2]
+        for b, (p_idx, g_idx) in enumerate(indices):
+            valid_mask = gt_valid_mask[b]
+            num_valid = int(valid_mask.sum().item())
+
+            # Count FN as ground-truth that got no match (if Hungarian returns < num_valid)
+            fn += max(0, num_valid - len(g_idx))
+
+            if len(p_idx) == 0:
+                continue
+
+            # Matched preds and gts
+            pb = pred_boxes[b, p_idx]                # [K,6]
+            gb = gt_boxes[b, valid_mask][g_idx]      # [K,6]
+            pi = pred_labels[b, p_idx]               # [K]
+            gi = gt_labels[b, valid_mask][g_idx]     # [K]
+
+            # IoU / TP/FP
+            # (reuse your SetCriterion box_iou_3d quickly)
+            # quick inline IoU (axis-aligned 3D)
+            pb_min = pb[:, :3] - pb[:, 3:] / 2
+            pb_max = pb[:, :3] + pb[:, 3:] / 2
+            gb_min = gb[:, :3] - gb[:, 3:] / 2
+            gb_max = gb[:, :3] + gb[:, 3:] / 2
+
+            inter_min = torch.maximum(pb_min, gb_min)
+            inter_max = torch.minimum(pb_max, gb_max)
+            inter = torch.clamp(inter_max - inter_min, min=0)
+            inter_v = inter.prod(dim=1)
+
+            pv = pb[:, 3:].prod(dim=1)
+            gv = gb[:, 3:].prod(dim=1)
+            union_v = pv + gv - inter_v + 1e-6
+            ious = inter_v / union_v
+
+            total_iou_sum += ious.sum().item()
+            total_iou_cnt += ious.numel()
+
+            # Classification accuracy over matched pairs
+            cls_correct += (pi == gi).sum().item()
+            cls_total += pi.numel()
+
+            # For detection PR: a matched pred counts as TP if IoU>=thr, else FP
+            tp_k = (ious >= iou_thresh).sum().item()
+            fp_k = (ious < iou_thresh).sum().item()
+            tp += tp_k
+            fp += fp_k
+
+            # (We already added FN above for unmatched gts)
+
+    miou = (total_iou_sum / total_iou_cnt) if total_iou_cnt > 0 else 0.0
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    cls_acc = (cls_correct / cls_total) if cls_total > 0 else 0.0
+
+    return {
+        'mIoU': miou,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'cls_acc': cls_acc,
+        'tp': tp, 'fp': fp, 'fn': fn
+    }
 
 def validate(model, dataloader, criterion, device):
     model.eval()
@@ -269,15 +364,18 @@ def main():
 
     # Hyperparameters (optimized for training)
     config = {
-        'batch_size': 4,  # Increased from 2 (GPU can handle more)
-        'num_epochs': 200,  # More epochs for better convergence
-        'lr': 2e-4,  # Slightly higher initial LR
+        'batch_size': 4,
+        'num_epochs': 200,
+        'lr': 2e-4,
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,
         'data_dir': '../../dataset/train',
+        'val_dir': '../../dataset/val',
         'save_dir': './checkpoints',
-        'warmup_epochs': 10  # Warmup for stable training
+        'warmup_epochs': 10,
+        'val_every': 1,
+        'iou_thresh': 0.5
     }
 
     # Create save directory
