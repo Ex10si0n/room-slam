@@ -90,7 +90,7 @@ def plot_augmented_views(dataset, sample_idx=0):
 
 def main():
     # Create dataset with augmentation
-    data_dir = "../../dataset"
+    data_dir = "../../dataset/train"
 
     print("Loading dataset with rotation augmentation...")
     dataset = TraceColliderDataset(
