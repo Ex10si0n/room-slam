@@ -398,13 +398,23 @@ def main():
         batch_size=config['batch_size'],
         shuffle=True,
         augment_rotation=True,
-        augment_translation=True,  # NEW: Random translation
-        augment_scale=True,  # NEW: Random scaling
-        augment_collider_dropout=True,  # NEW: Random collider dropout
+        augment_translation=True,
+        augment_scale=True,
+        augment_collider_dropout=True,
         rotation_angles=[0, 90, 180, 270],
         scale_range=(0.8, 1.2),
         translation_range=1.0,
         collider_dropout_prob=0.2
+    )
+
+    val_loader = create_dataloader(
+        config['val_dir'],
+        batch_size=config['batch_size'],
+        shuffle=False,
+        augment_rotation=False,
+        augment_translation=False,
+        augment_scale=False,
+        augment_collider_dropout=False
     )
 
     # Build model
@@ -442,30 +452,40 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Training loop
-    best_loss = float('inf')
+    best_val_loss = float('inf')
 
     for epoch in range(config['num_epochs']):
-        # Train
+        # === Train ===
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch
         )
 
-        # Update scheduler
+        # LR schedule step
         scheduler.step()
-
         print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, LR = {scheduler.get_last_lr()[0]:.6f}")
 
-        # Save checkpoint
-        if train_loss < best_loss:
-            best_loss = train_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': train_loss,
-                'config': config
-            }, Path(config['save_dir']) / 'best_model.pth')
-            print(f"Saved best model with loss {best_loss:.4f}")
+        # Validate
+        if (epoch + 1) % config['val_every'] == 0:
+            val_loss = validate(model, val_loader, criterion, device)
+            metrics = evaluate_metrics(model, val_loader, device, iou_thresh=config['iou_thresh'])
+
+            print(f"[Val @ Epoch {epoch}] loss={val_loss:.4f} "
+                  f"mIoU={metrics['mIoU']:.3f} "
+                  f"P={metrics['precision']:.3f} R={metrics['recall']:.3f} F1={metrics['f1']:.3f} "
+                  f"ClsAcc={metrics['cls_acc']:.3f}  (tp={metrics['tp']}, fp={metrics['fp']}, fn={metrics['fn']})")
+
+            # Save best on validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': val_loss,
+                    'metrics': metrics,
+                    'config': config
+                }, Path(config['save_dir']) / 'best_model.pth')
+                print(f"✓ Saved BEST model (val_loss={best_val_loss:.4f})")
 
         # Regular checkpoint
         if (epoch + 1) % 10 == 0:
@@ -473,7 +493,7 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': train_loss,
+                'train_loss': train_loss,
             }, Path(config['save_dir']) / f'checkpoint_epoch_{epoch}.pth')
 
     print("Training completed!")
