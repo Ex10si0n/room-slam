@@ -13,23 +13,31 @@ class TraceColliderDataset(Dataset):
     Expects dual-file format:
     - Trace files: *_trace.json (contains list of trace points)
     - Collider files: *_collider.json (contains collider ground truth)
+
+    Supports data augmentation with rotation (0°, 90°, 180°, 270°)
     """
 
     def __init__(
             self,
             data_dir: str,
-            max_trace_len: int = 5000,
-            max_colliders: int = 50
+            max_trace_len: int = 3000,
+            max_colliders: int = 50,
+            augment_rotation: bool = True,
+            rotation_angles: list = [0, 90, 180, 270]
     ):
         """
         Args:
             data_dir: Directory containing trace and collider JSON files
             max_trace_len: Maximum number of trace points (longer traces are downsampled)
             max_colliders: Maximum number of colliders per scene (for padding)
+            augment_rotation: If True, apply rotation augmentation
+            rotation_angles: List of rotation angles in degrees (around Y-axis)
         """
         self.data_dir = Path(data_dir)
         self.max_trace_len = max_trace_len
         self.max_colliders = max_colliders
+        self.augment_rotation = augment_rotation
+        self.rotation_angles = rotation_angles
 
         # Label mapping
         self.label_to_id = {
@@ -41,8 +49,23 @@ class TraceColliderDataset(Dataset):
         self.id_to_label = {v: k for k, v in self.label_to_id.items()}
 
         # Load file pairs
-        self.data_pairs = self._load_data_pairs()
-        print(f"Found {len(self.data_pairs)} samples in {data_dir}")
+        self.base_data_pairs = self._load_data_pairs()
+        print(f"Found {len(self.base_data_pairs)} base samples in {data_dir}")
+
+        # Expand dataset with rotations
+        if self.augment_rotation:
+            self.data_pairs = []
+            for pair in self.base_data_pairs:
+                for angle in self.rotation_angles:
+                    self.data_pairs.append({
+                        'trace': pair['trace'],
+                        'collider': pair['collider'],
+                        'rotation': angle
+                    })
+            print(f"Augmented to {len(self.data_pairs)} samples with rotations: {rotation_angles}°")
+        else:
+            self.data_pairs = [{'trace': p['trace'], 'collider': p['collider'], 'rotation': 0}
+                               for p in self.base_data_pairs]
 
         if len(self.data_pairs) == 0:
             raise ValueError(f"No valid data files found in {data_dir}")
@@ -102,12 +125,103 @@ class TraceColliderDataset(Dataset):
 
         return pairs
 
+    def _rotate_traces(self, traces: List[Dict], angle_degrees: float) -> List[Dict]:
+        """
+        Rotate traces around Y-axis (vertical axis).
+
+        Args:
+            traces: List of trace points with x, y, z, timestamp
+            angle_degrees: Rotation angle in degrees (90, 180, 270)
+
+        Returns:
+            Rotated traces
+        """
+        angle_rad = np.radians(angle_degrees)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+
+        # Rotation matrix around Y-axis
+        # [x']   [cos  0  sin] [x]
+        # [y'] = [ 0   1   0 ] [y]
+        # [z']   [-sin 0  cos] [z]
+
+        rotated_traces = []
+        for point in traces:
+            x, y, z = point['x'], point['y'], point['z']
+
+            # Apply rotation
+            x_new = cos_a * x + sin_a * z
+            z_new = -sin_a * x + cos_a * z
+
+            rotated_traces.append({
+                'x': x_new,
+                'y': y,  # Y unchanged (vertical axis)
+                'z': z_new,
+                'timestamp': point['timestamp']
+            })
+
+        return rotated_traces
+
+    def _rotate_colliders(self, colliders: List[Dict], angle_degrees: float) -> List[Dict]:
+        """
+        Rotate colliders around Y-axis.
+
+        Args:
+            colliders: List of collider dicts with center and size
+            angle_degrees: Rotation angle in degrees
+
+        Returns:
+            Rotated colliders
+        """
+        angle_rad = np.radians(angle_degrees)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+
+        rotated_colliders = []
+        for col in colliders:
+            center = col['center']
+            size = col['size']
+
+            # Rotate center position
+            cx, cy, cz = center['x'], center['y'], center['z']
+            cx_new = cos_a * cx + sin_a * cz
+            cz_new = -sin_a * cx + cos_a * cz
+
+            # Rotate size (swap x and z for 90° and 270°)
+            sx, sy, sz = size['x'], size['y'], size['z']
+
+            if angle_degrees == 90 or angle_degrees == 270:
+                # Swap X and Z dimensions
+                sx_new, sz_new = sz, sx
+            else:
+                # 0° or 180°: keep dimensions
+                sx_new, sz_new = sx, sz
+
+            rotated_colliders.append({
+                'type': col.get('type', 'BoxCollider'),
+                'label': col.get('label', 'BLOCK'),
+                'center': {
+                    'x': float(cx_new),
+                    'y': float(cy),
+                    'z': float(cz_new)
+                },
+                'size': {
+                    'x': float(sx_new),
+                    'y': float(sy),
+                    'z': float(sz_new)
+                },
+                'radius': col.get('radius', 0.0),
+                'height': col.get('height', 0.0)
+            })
+
+        return rotated_colliders
+
     def __len__(self):
         return len(self.data_pairs)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get a single sample.
+        Get a single sample with optional rotation augmentation.
 
         Returns:
             Dict containing:
@@ -119,8 +233,10 @@ class TraceColliderDataset(Dataset):
                 - num_traces: scalar tensor
                 - num_colliders: scalar tensor
                 - filename: string
+                - rotation: rotation angle applied
         """
         pair = self.data_pairs[idx]
+        rotation_angle = pair['rotation']
 
         # Load trace data
         with open(pair['trace'], 'r') as f:
@@ -132,10 +248,17 @@ class TraceColliderDataset(Dataset):
 
         # Extract traces (should be a list of dicts)
         traces = trace_data if isinstance(trace_data, list) else []
-        trace_array = self._process_traces(traces)
 
         # Extract colliders
         colliders = collider_data.get('colliders', [])
+
+        # Apply rotation augmentation
+        if rotation_angle != 0:
+            traces = self._rotate_traces(traces, rotation_angle)
+            colliders = self._rotate_colliders(colliders, rotation_angle)
+
+        # Process data
+        trace_array = self._process_traces(traces)
         collider_boxes, collider_labels, collider_valid = self._process_colliders(colliders)
 
         return {
@@ -146,7 +269,8 @@ class TraceColliderDataset(Dataset):
             'valid_mask': collider_valid,  # [M]
             'num_traces': torch.tensor(len(traces), dtype=torch.long),
             'num_colliders': torch.tensor(len(colliders), dtype=torch.long),
-            'filename': pair['trace'].name
+            'filename': f"{pair['trace'].name}_rot{rotation_angle}",
+            'rotation': torch.tensor(rotation_angle, dtype=torch.float32)
         }
 
     def _process_traces(self, traces: List[Dict]) -> torch.Tensor:
@@ -296,7 +420,9 @@ def create_dataloader(
         shuffle: bool = True,
         num_workers: int = 0,
         max_trace_len: int = 3000,  # Reduced from 5000 for better performance
-        max_colliders: int = 50
+        max_colliders: int = 50,
+        augment_rotation: bool = True,
+        rotation_angles: list = [0, 90, 180, 270]
 ) -> DataLoader:
     """
     Create dataloader for trace-collider dataset.
@@ -308,6 +434,8 @@ def create_dataloader(
         num_workers: Number of worker processes for data loading
         max_trace_len: Maximum trace length (longer traces are downsampled)
         max_colliders: Maximum number of colliders per scene
+        augment_rotation: If True, apply rotation augmentation
+        rotation_angles: List of rotation angles in degrees (e.g., [0, 90, 180, 270])
 
     Returns:
         DataLoader instance
@@ -315,7 +443,9 @@ def create_dataloader(
     dataset = TraceColliderDataset(
         data_dir=data_dir,
         max_trace_len=max_trace_len,
-        max_colliders=max_colliders
+        max_colliders=max_colliders,
+        augment_rotation=augment_rotation,
+        rotation_angles=rotation_angles
     )
 
     loader = DataLoader(
@@ -330,26 +460,40 @@ def create_dataloader(
     return loader
 
 
-def print_dataset_statistics(data_dir: str):
+def print_dataset_statistics(data_dir: str, augment_rotation: bool = True):
     """Print statistics about the dataset."""
-    dataset = TraceColliderDataset(data_dir)
+    dataset = TraceColliderDataset(
+        data_dir,
+        augment_rotation=augment_rotation,
+        rotation_angles=[0, 90, 180, 270] if augment_rotation else [0]
+    )
 
     print(f"\n{'=' * 50}")
     print(f"Dataset Statistics")
     print(f"{'=' * 50}")
-    print(f"Total samples: {len(dataset)}")
+    print(f"Base samples: {len(dataset.base_data_pairs)}")
+    if augment_rotation:
+        print(f"Total samples (with augmentation): {len(dataset)}")
+        print(f"Augmentation: {dataset.rotation_angles}°")
+    else:
+        print(f"Total samples: {len(dataset)}")
 
     # Analyze first few samples (or all if dataset is small)
     num_samples_to_analyze = min(len(dataset), 100)
     num_traces_list = []
     num_colliders_list = []
     label_counts = {label: 0 for label in dataset.label_to_id.keys()}
+    rotation_counts = {}
 
     for i in range(num_samples_to_analyze):
         sample = dataset[i]
         num_traces_list.append(sample['num_traces'].item())
         num_colliders = sample['valid_mask'].sum().item()
         num_colliders_list.append(num_colliders)
+
+        # Count rotations
+        rot = sample['rotation'].item()
+        rotation_counts[rot] = rotation_counts.get(rot, 0) + 1
 
         # Count labels
         valid_labels = sample['labels'][sample['valid_mask']]
@@ -366,6 +510,11 @@ def print_dataset_statistics(data_dir: str):
     print(f"  Min colliders: {min(num_colliders_list)}")
     print(f"  Max colliders: {max(num_colliders_list)}")
     print(f"  Avg colliders: {np.mean(num_colliders_list):.1f}")
+
+    if augment_rotation:
+        print(f"\nRotation distribution (first {num_samples_to_analyze} samples):")
+        for angle in sorted(rotation_counts.keys()):
+            print(f"  {int(angle)}°: {rotation_counts[angle]} samples")
 
     print(f"\nLabel distribution:")
     for label, count in label_counts.items():
@@ -385,21 +534,31 @@ if __name__ == "__main__":
 
     print(f"Testing dataloader with data from: {data_dir}")
 
-    # Print dataset statistics
+    # Print statistics WITH augmentation
     try:
-        print_dataset_statistics(data_dir)
+        print("\n=== WITH Rotation Augmentation ===")
+        print_dataset_statistics(data_dir, augment_rotation=True)
     except Exception as e:
         print(f"Error in statistics: {e}")
         import traceback
 
         traceback.print_exc()
 
+    # Print statistics WITHOUT augmentation
+    try:
+        print("\n=== WITHOUT Rotation Augmentation ===")
+        print_dataset_statistics(data_dir, augment_rotation=False)
+    except Exception as e:
+        print(f"Error in statistics: {e}")
+
     # Test dataloader
     try:
+        print("\n=== Testing Dataloader ===")
         loader = create_dataloader(
             data_dir,
             batch_size=2,
-            shuffle=False
+            shuffle=False,
+            augment_rotation=True
         )
 
         print(f"Created dataloader with {len(loader)} batches")
@@ -433,6 +592,8 @@ if __name__ == "__main__":
 
             if batch_idx >= 2:  # Only show first 3 batches
                 break
+
+        print("\n✓ Dataloader test passed!")
 
     except Exception as e:
         print(f"Error testing dataloader: {e}")

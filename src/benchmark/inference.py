@@ -7,7 +7,7 @@ from model import build_model
 
 def load_model(checkpoint_path: str, device):
     """Load trained model"""
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
 
     config = checkpoint.get('config', {})
     model = build_model(
@@ -45,8 +45,78 @@ def process_traces(traces):
     return torch.from_numpy(trace_array)
 
 
-def post_process_predictions(boxes, classes, confidence_threshold=0.5):
-    """Filter and format predictions"""
+def compute_iou_3d(box1, box2):
+    """
+    Compute 3D IoU between two boxes.
+    box: [cx, cy, cz, sx, sy, sz]
+    """
+    # Convert to corner format
+    box1_min = box1[:3] - box1[3:] / 2
+    box1_max = box1[:3] + box1[3:] / 2
+    box2_min = box2[:3] - box2[3:] / 2
+    box2_max = box2[:3] + box2[3:] / 2
+
+    # Compute intersection
+    inter_min = torch.maximum(box1_min, box2_min)
+    inter_max = torch.minimum(box1_max, box2_max)
+    inter_size = torch.clamp(inter_max - inter_min, min=0)
+    inter_volume = inter_size.prod()
+
+    # Compute union
+    box1_volume = box1[3:].prod()
+    box2_volume = box2[3:].prod()
+    union_volume = box1_volume + box2_volume - inter_volume
+
+    # IoU
+    iou = inter_volume / (union_volume + 1e-6)
+    return iou.item()
+
+
+def nms_3d(boxes, scores, iou_threshold=0.5):
+    """
+    Non-Maximum Suppression for 3D boxes.
+
+    Args:
+        boxes: [N, 6] tensor
+        scores: [N] tensor
+        iou_threshold: IoU threshold for suppression
+
+    Returns:
+        keep_indices: List of indices to keep
+    """
+    if len(boxes) == 0:
+        return []
+
+    # Sort by scores
+    sorted_indices = torch.argsort(scores, descending=True)
+
+    keep = []
+    while len(sorted_indices) > 0:
+        # Keep the highest scoring box
+        current = sorted_indices[0].item()
+        keep.append(current)
+
+        if len(sorted_indices) == 1:
+            break
+
+        # Compute IoU with remaining boxes
+        current_box = boxes[current]
+        remaining_indices = sorted_indices[1:]
+
+        # Filter out boxes with high IoU
+        new_remaining = []
+        for idx in remaining_indices:
+            iou = compute_iou_3d(current_box, boxes[idx])
+            if iou < iou_threshold:
+                new_remaining.append(idx)
+
+        sorted_indices = torch.tensor(new_remaining, dtype=torch.long)
+
+    return keep
+
+
+def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_threshold=0.3):
+    """Filter and format predictions with NMS"""
     # boxes: [Q, 6] (cx, cy, cz, sx, sy, sz)
     # classes: [Q, 4] (logits)
 
@@ -58,37 +128,63 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.5):
 
     # Filter by confidence
     valid_mask = max_probs > confidence_threshold
+    valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    if len(valid_indices) == 0:
+        return []
+
+    # Get valid predictions
+    valid_boxes = boxes[valid_indices]
+    valid_scores = max_probs[valid_indices]
+    valid_labels = pred_labels[valid_indices]
+
+    # Apply NMS per class
+    keep_indices = []
+    for label_id in range(4):
+        class_mask = valid_labels == label_id
+        class_indices = class_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        if len(class_indices) == 0:
+            continue
+
+        class_boxes = valid_boxes[class_indices]
+        class_scores = valid_scores[class_indices]
+
+        # NMS for this class
+        keep = nms_3d(class_boxes, class_scores, nms_threshold)
+        keep_indices.extend(class_indices[keep].tolist())
 
     # Format predictions
     predictions = []
-    for i in range(len(boxes)):
-        if valid_mask[i]:
-            box = boxes[i].cpu().numpy()
-            label = label_map[pred_labels[i].item()]
-            conf = max_probs[i].item()
+    for i in keep_indices:
+        box = valid_boxes[
+            valid_indices.tolist().index(i) if isinstance(valid_indices, torch.Tensor) else i].cpu().numpy()
+        label = label_map[
+            valid_labels[valid_indices.tolist().index(i) if isinstance(valid_indices, torch.Tensor) else i].item()]
+        conf = valid_scores[valid_indices.tolist().index(i) if isinstance(valid_indices, torch.Tensor) else i].item()
 
-            predictions.append({
-                'type': 'BoxCollider',
-                'label': label,
-                'confidence': float(conf),
-                'center': {
-                    'x': float(box[0]),
-                    'y': float(box[1]),
-                    'z': float(box[2])
-                },
-                'size': {
-                    'x': float(box[3]),
-                    'y': float(box[4]),
-                    'z': float(box[5])
-                },
-                'radius': 0.0,
-                'height': 0.0
-            })
+        predictions.append({
+            'type': 'BoxCollider',
+            'label': label,
+            'confidence': float(conf),
+            'center': {
+                'x': float(box[0]),
+                'y': float(box[1]),
+                'z': float(box[2])
+            },
+            'size': {
+                'x': float(box[3]),
+                'y': float(box[4]),
+                'z': float(box[5])
+            },
+            'radius': 0.0,
+            'height': 0.0
+        })
 
     return predictions
 
 
-def predict(model, traces_file, device, confidence_threshold=0.5):
+def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=0.3):
     """Run prediction on a trace file"""
 
     # Load traces
@@ -114,12 +210,12 @@ def predict(model, traces_file, device, confidence_threshold=0.5):
     with torch.no_grad():
         outputs = model(trace_tensor)
 
-    # Post-process
+    # Post-process with NMS
     pred_boxes = outputs['pred_boxes'][0]  # [Q, 6]
     pred_classes = outputs['pred_classes'][0]  # [Q, 4]
 
     predictions = post_process_predictions(
-        pred_boxes, pred_classes, confidence_threshold
+        pred_boxes, pred_classes, confidence_threshold, nms_threshold
     )
 
     return predictions
@@ -133,8 +229,10 @@ def main():
                         help='Input trace file (JSON)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output file for predictions')
-    parser.add_argument('--threshold', type=float, default=0.5,
-                        help='Confidence threshold')
+    parser.add_argument('--threshold', type=float, default=0.7,
+                        help='Confidence threshold (default: 0.7)')
+    parser.add_argument('--nms', type=float, default=0.3,
+                        help='NMS IoU threshold (default: 0.3)')
     args = parser.parse_args()
 
     # Setup device - use CUDA
@@ -151,7 +249,7 @@ def main():
 
     # Run prediction
     print(f"Processing {args.input}")
-    predictions = predict(model, args.input, device, args.threshold)
+    predictions = predict(model, args.input, device, args.threshold, args.nms)
 
     print(f"\nFound {len(predictions)} colliders:")
     for i, pred in enumerate(predictions):
@@ -165,7 +263,8 @@ def main():
             'colliders': predictions,
             'metadata': {
                 'num_colliders': len(predictions),
-                'threshold': args.threshold
+                'confidence_threshold': args.threshold,
+                'nms_threshold': args.nms
             }
         }
 

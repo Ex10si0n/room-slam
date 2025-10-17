@@ -170,19 +170,10 @@ def main():
     fig_top = plot_top_view(traces, colliders, predictions,
                             title=f"Top View - {Path(args.input).name}")
 
-    if traces and any('y' in p for p in traces):
-        fig_side = plot_side_view(traces, colliders, predictions,
-                                  title=f"Side View - {Path(args.input).name}")
-
     # Save or show
     if args.output:
         fig_top.savefig(args.output, dpi=150, bbox_inches='tight')
         print(f"Saved visualization to {args.output}")
-
-        if traces and any('y' in p for p in traces):
-            side_output = args.output.replace('.png', '_side.png')
-            fig_side.savefig(side_output, dpi=150, bbox_inches='tight')
-            print(f"Saved side view to {side_output}")
     else:
         plt.show()
 
