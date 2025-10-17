@@ -143,8 +143,14 @@ def main():
 
     # Load data
     data = load_data(args.input)
-    traces = data.get('traces', data.get('trajectory', []))
-    colliders = data.get('colliders', [])
+
+    # Handle both formats for traces
+    if isinstance(data, list):
+        traces = data
+        colliders = []
+    else:
+        traces = data.get('traces', data.get('trajectory', []))
+        colliders = data.get('colliders', [])
 
     predictions = None
     if args.predictions:
