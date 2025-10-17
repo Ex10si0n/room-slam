@@ -29,8 +29,8 @@ class PositionalEncoding(nn.Module):
 class TraceEncoder(nn.Module):
     """Encode trace sequences with Transformer"""
 
-    def __init__(self, d_model: int = 256, nhead: int = 8,
-                 num_layers: int = 6, dim_feedforward: int = 1024):
+    def __init__(self, d_model: int = 128, nhead: int = 4,
+                 num_layers: int = 3, dim_feedforward: int = 512):
         super().__init__()
 
         # Input projection: (x,y,z,t) -> d_model
@@ -74,8 +74,8 @@ class TraceEncoder(nn.Module):
 class ColliderDecoder(nn.Module):
     """Decode colliders using learnable queries (DETR-style)"""
 
-    def __init__(self, d_model: int = 256, nhead: int = 8,
-                 num_layers: int = 6, num_queries: int = 50):
+    def __init__(self, d_model: int = 128, nhead: int = 4,
+                 num_layers: int = 3, num_queries: int = 30):
         super().__init__()
 
         self.num_queries = num_queries
@@ -87,14 +87,14 @@ class ColliderDecoder(nn.Module):
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=1024,
+            dim_feedforward=512,
             dropout=0.1,
             batch_first=True
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers)
 
         # Prediction heads
-        self.box_head = MLP(d_model, d_model, 6, 3)  # cx,cy,cz,sx,sy,sz
+        self.box_head = MLP(d_model, d_model, 6, 2)  # cx,cy,cz,sx,sy,sz
         self.class_head = nn.Linear(d_model, 4)  # BLOCK/LOW/MID/HIGH
 
     def forward(self, memory: torch.Tensor, memory_mask: Optional[torch.Tensor] = None):
@@ -147,11 +147,11 @@ class MLP(nn.Module):
 
 
 class TraceToColliderTransformer(nn.Module):
-    """Complete model: Trace -> Colliders"""
+    """Complete model: Trace -> Colliders (Lightweight version for M4 24GB)"""
 
-    def __init__(self, d_model: int = 256, nhead: int = 8,
-                 num_encoder_layers: int = 6, num_decoder_layers: int = 6,
-                 num_queries: int = 50):
+    def __init__(self, d_model: int = 128, nhead: int = 4,
+                 num_encoder_layers: int = 3, num_decoder_layers: int = 3,
+                 num_queries: int = 30):
         super().__init__()
 
         self.encoder = TraceEncoder(
@@ -180,29 +180,68 @@ class TraceToColliderTransformer(nn.Module):
         }
 
 
-def build_model(num_queries: int = 50, d_model: int = 256):
-    """Build model"""
+def build_model(num_queries: int = 30, d_model: int = 128):
+    """
+    Build lightweight model for M4 24GB.
+
+    Reduced parameters:
+    - d_model: 256 -> 128
+    - num_encoder_layers: 6 -> 3
+    - num_decoder_layers: 6 -> 3
+    - nhead: 8 -> 4
+    - dim_feedforward: 1024 -> 512
+    - num_queries: 50 -> 30
+
+    Args:
+        num_queries: Number of object queries (max detections per scene)
+        d_model: Model dimension
+
+    Returns:
+        TraceToColliderTransformer model
+    """
     model = TraceToColliderTransformer(
         d_model=d_model,
-        nhead=8,
-        num_encoder_layers=6,
-        num_decoder_layers=6,
+        nhead=4,
+        num_encoder_layers=3,
+        num_decoder_layers=3,
         num_queries=num_queries
     )
 
     return model
 
 
+def count_parameters(model):
+    """Count trainable parameters"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 if __name__ == "__main__":
     # Test model
+    print("Building lightweight model...")
     model = build_model()
 
-    # Dummy input
-    traces = torch.randn(2, 100, 4)
-    mask = torch.ones(2, 100, dtype=torch.bool)
+    # Count parameters
+    num_params = count_parameters(model)
+    print(f"Total trainable parameters: {num_params:,}")
+    print(f"Estimated model size: ~{num_params * 4 / 1024 / 1024:.1f} MB (FP32)")
+
+    # Test forward pass
+    print("\nTesting forward pass...")
+    batch_size = 2
+    seq_len = 1000
+    traces = torch.randn(batch_size, seq_len, 4)
+    mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
 
     output = model(traces, mask)
 
     print("Output shapes:")
     print(f"  Boxes: {output['pred_boxes'].shape}")
     print(f"  Classes: {output['pred_classes'].shape}")
+
+    # Memory estimate
+    print(f"\nMemory estimate for batch_size={batch_size}, seq_len={seq_len}:")
+    print(f"  Input: ~{batch_size * seq_len * 4 * 4 / 1024 / 1024:.2f} MB")
+    print(f"  Model: ~{num_params * 4 / 1024 / 1024:.1f} MB")
+    print(f"  Output: ~{batch_size * 30 * 10 * 4 / 1024:.2f} MB")
+
+    print("\n✓ Model test passed!")

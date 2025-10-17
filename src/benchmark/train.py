@@ -19,21 +19,21 @@ class HungarianMatcher:
         self.cost_box = cost_box
 
     @torch.no_grad()
-    def forward(self, pred_boxes, pred_classes, gt_boxes, gt_labels):
+    def forward(self, pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask):
         """
         pred_boxes: [B, Q, 6]
         pred_classes: [B, Q, 4]
-        gt_boxes: [B, M, 7]
+        gt_boxes: [B, M, 6]
         gt_labels: [B, M]
+        gt_valid_mask: [B, M] - True for valid colliders
         """
         B, Q = pred_boxes.shape[:2]
-        M = gt_boxes.shape[1]
 
         indices = []
 
         for b in range(B):
-            # Get valid ground truth (not padding)
-            valid_mask = gt_labels[b] >= 0
+            # Get valid ground truth using valid_mask
+            valid_mask = gt_valid_mask[b]
             num_valid = valid_mask.sum().item()
 
             if num_valid == 0:
@@ -45,8 +45,8 @@ class HungarianMatcher:
             cost_class = -prob[:, gt_labels[b, valid_mask]]  # [Q, num_valid]
 
             # Box L1 cost
-            pred_box = pred_boxes[b][:, :6]  # [Q, 6]
-            gt_box = gt_boxes[b, valid_mask, :6]  # [num_valid, 6]
+            pred_box = pred_boxes[b]  # [Q, 6]
+            gt_box = gt_boxes[b, valid_mask]  # [num_valid, 6]
             cost_box = torch.cdist(pred_box, gt_box, p=1)  # [Q, num_valid]
 
             # Total cost
@@ -77,19 +77,20 @@ class SetCriterion(nn.Module):
         pred_classes = outputs['pred_classes']
         gt_boxes = targets['boxes']
         gt_labels = targets['labels']
+        gt_valid_mask = targets['valid_mask']  # Use valid_mask from dataloader
 
         # Hungarian matching
-        indices = self.matcher.forward(pred_boxes, pred_classes, gt_boxes, gt_labels)
+        indices = self.matcher.forward(pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask)
 
         # Compute losses
         losses = {}
 
         # Classification loss
-        class_loss = self._compute_class_loss(pred_classes, gt_labels, indices)
+        class_loss = self._compute_class_loss(pred_classes, gt_labels, gt_valid_mask, indices)
         losses['class_loss'] = class_loss
 
         # Box regression loss
-        box_loss = self._compute_box_loss(pred_boxes, gt_boxes, indices)
+        box_loss = self._compute_box_loss(pred_boxes, gt_boxes, gt_valid_mask, indices)
         losses['box_loss'] = box_loss
 
         # Total loss
@@ -98,8 +99,7 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    def _compute_class_loss(self, pred_classes, gt_labels, indices):
-        B = pred_classes.shape[0]
+    def _compute_class_loss(self, pred_classes, gt_labels, gt_valid_mask, indices):
         device = pred_classes.device
 
         # Gather matched predictions and targets
@@ -109,8 +109,9 @@ class SetCriterion(nn.Module):
         for b, (pred_idx, gt_idx) in enumerate(indices):
             if len(pred_idx) > 0:
                 pred_list.append(pred_classes[b, pred_idx])
-                valid_mask = gt_labels[b] >= 0
-                valid_labels = gt_labels[b, valid_mask]
+
+                # Get valid labels using valid_mask
+                valid_labels = gt_labels[b, gt_valid_mask[b]]
                 target_list.append(valid_labels[gt_idx])
 
         if len(pred_list) == 0:
@@ -121,7 +122,7 @@ class SetCriterion(nn.Module):
 
         return self.class_loss(pred_cat, target_cat)
 
-    def _compute_box_loss(self, pred_boxes, gt_boxes, indices):
+    def _compute_box_loss(self, pred_boxes, gt_boxes, gt_valid_mask, indices):
         device = pred_boxes.device
 
         pred_list = []
@@ -129,9 +130,10 @@ class SetCriterion(nn.Module):
 
         for b, (pred_idx, gt_idx) in enumerate(indices):
             if len(pred_idx) > 0:
-                pred_list.append(pred_boxes[b, pred_idx, :6])
-                valid_mask = gt_boxes[b, :, 6] >= 0  # Check if valid
-                valid_boxes = gt_boxes[b, valid_mask, :6]
+                pred_list.append(pred_boxes[b, pred_idx])
+
+                # Get valid boxes using valid_mask
+                valid_boxes = gt_boxes[b, gt_valid_mask[b]]
                 target_list.append(valid_boxes[gt_idx])
 
         if len(pred_list) == 0:
@@ -155,12 +157,17 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         mask = batch['trace_mask'].to(device)
         boxes = batch['boxes'].to(device)
         labels = batch['labels'].to(device)
+        valid_mask = batch['valid_mask'].to(device)  # Add valid_mask
 
         # Forward
         outputs = model(traces, mask)
 
         # Compute loss
-        targets = {'boxes': boxes, 'labels': labels}
+        targets = {
+            'boxes': boxes,
+            'labels': labels,
+            'valid_mask': valid_mask  # Pass valid_mask to criterion
+        }
         losses = criterion(outputs, targets)
 
         loss = losses['total_loss']
@@ -193,9 +200,14 @@ def validate(model, dataloader, criterion, device):
             mask = batch['trace_mask'].to(device)
             boxes = batch['boxes'].to(device)
             labels = batch['labels'].to(device)
+            valid_mask = batch['valid_mask'].to(device)  # Add valid_mask
 
             outputs = model(traces, mask)
-            targets = {'boxes': boxes, 'labels': labels}
+            targets = {
+                'boxes': boxes,
+                'labels': labels,
+                'valid_mask': valid_mask  # Pass valid_mask
+            }
             losses = criterion(outputs, targets)
 
             total_loss += losses['total_loss'].item()
@@ -204,18 +216,22 @@ def validate(model, dataloader, criterion, device):
 
 
 def main():
-    # Setup
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Setup device - use CUDA
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
+    else:
+        device = torch.device("cpu")
+        print(f"CUDA not available, using CPU")
 
-    # Hyperparameters
+    # Hyperparameters (optimized for M4 24GB)
     config = {
-        'batch_size': 4,
+        'batch_size': 2,  # Reduced for memory
         'num_epochs': 100,
         'lr': 1e-4,
         'weight_decay': 1e-4,
-        'd_model': 256,
-        'num_queries': 50,
+        'd_model': 128,  # Reduced from 256
+        'num_queries': 30,  # Reduced from 50
         'data_dir': '../../dataset',
         'save_dir': './checkpoints'
     }
