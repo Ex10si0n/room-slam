@@ -14,7 +14,11 @@ class TraceColliderDataset(Dataset):
     - Trace files: *_trace.json (contains list of trace points)
     - Collider files: *_collider.json (contains collider ground truth)
 
-    Supports data augmentation with rotation (0°, 90°, 180°, 270°)
+    Supports aggressive data augmentation:
+    - Rotation (0°, 90°, 180°, 270°)
+    - Translation (random shifts)
+    - Scaling (simulate different room sizes)
+    - Collider dropout (remove random colliders)
     """
 
     def __init__(
@@ -23,21 +27,41 @@ class TraceColliderDataset(Dataset):
             max_trace_len: int = 3000,
             max_colliders: int = 50,
             augment_rotation: bool = True,
-            rotation_angles: list = [0, 90, 180, 270]
+            augment_translation: bool = True,
+            augment_scale: bool = True,
+            augment_collider_dropout: bool = True,
+            rotation_angles: list = [0, 90, 180, 270],
+            scale_range: tuple = (0.8, 1.2),
+            translation_range: float = 1.0,
+            collider_dropout_prob: float = 0.2
     ):
         """
         Args:
             data_dir: Directory containing trace and collider JSON files
-            max_trace_len: Maximum number of trace points (longer traces are downsampled)
-            max_colliders: Maximum number of colliders per scene (for padding)
+            max_trace_len: Maximum number of trace points
+            max_colliders: Maximum number of colliders per scene
             augment_rotation: If True, apply rotation augmentation
-            rotation_angles: List of rotation angles in degrees (around Y-axis)
+            augment_translation: If True, apply random translation
+            augment_scale: If True, apply random scaling
+            augment_collider_dropout: If True, randomly drop colliders
+            rotation_angles: List of rotation angles in degrees
+            scale_range: (min_scale, max_scale) for random scaling
+            translation_range: Maximum translation in meters
+            collider_dropout_prob: Probability of dropping each collider
         """
         self.data_dir = Path(data_dir)
         self.max_trace_len = max_trace_len
         self.max_colliders = max_colliders
+
+        # Augmentation settings
         self.augment_rotation = augment_rotation
+        self.augment_translation = augment_translation
+        self.augment_scale = augment_scale
+        self.augment_collider_dropout = augment_collider_dropout
         self.rotation_angles = rotation_angles
+        self.scale_range = scale_range
+        self.translation_range = translation_range
+        self.collider_dropout_prob = collider_dropout_prob
 
         # Label mapping
         self.label_to_id = {
@@ -216,24 +240,86 @@ class TraceColliderDataset(Dataset):
 
         return rotated_colliders
 
+    def _translate_traces(self, traces: List[Dict], tx: float, tz: float) -> List[Dict]:
+        """Translate traces in X-Z plane"""
+        return [{
+            'x': p['x'] + tx,
+            'y': p['y'],
+            'z': p['z'] + tz,
+            'timestamp': p['timestamp']
+        } for p in traces]
+
+    def _translate_colliders(self, colliders: List[Dict], tx: float, tz: float) -> List[Dict]:
+        """Translate colliders in X-Z plane"""
+        translated = []
+        for col in colliders:
+            new_col = col.copy()
+            new_col['center'] = {
+                'x': col['center']['x'] + tx,
+                'y': col['center']['y'],
+                'z': col['center']['z'] + tz
+            }
+            translated.append(new_col)
+        return translated
+
+    def _scale_traces(self, traces: List[Dict], scale: float) -> List[Dict]:
+        """Scale traces (simulate different room sizes)"""
+        return [{
+            'x': p['x'] * scale,
+            'y': p['y'] * scale,
+            'z': p['z'] * scale,
+            'timestamp': p['timestamp']
+        } for p in traces]
+
+    def _scale_colliders(self, colliders: List[Dict], scale: float) -> List[Dict]:
+        """Scale colliders"""
+        scaled = []
+        for col in colliders:
+            scaled.append({
+                'type': col.get('type', 'BoxCollider'),
+                'label': col.get('label', 'BLOCK'),
+                'center': {
+                    'x': col['center']['x'] * scale,
+                    'y': col['center']['y'] * scale,
+                    'z': col['center']['z'] * scale
+                },
+                'size': {
+                    'x': col['size']['x'] * scale,
+                    'y': col['size']['y'] * scale,
+                    'z': col['size']['z'] * scale
+                },
+                'radius': col.get('radius', 0.0) * scale,
+                'height': col.get('height', 0.0) * scale
+            })
+        return scaled
+
+    def _dropout_colliders(self, colliders: List[Dict], dropout_prob: float) -> List[Dict]:
+        """
+        Randomly drop colliders to force model to learn from traces.
+        Never drop walls (BLOCK with large size).
+        """
+        kept_colliders = []
+        for col in colliders:
+            # Keep walls (large BLOCK colliders)
+            is_wall = (col.get('label') == 'BLOCK' and
+                       (col['size'].get('x', 0) > 5.0 or
+                        col['size'].get('z', 0) > 5.0))
+
+            # Keep with probability or if it's a wall
+            if is_wall or np.random.rand() > dropout_prob:
+                kept_colliders.append(col)
+
+        return kept_colliders if kept_colliders else colliders  # Keep at least something
+
     def __len__(self):
         return len(self.data_pairs)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get a single sample with optional rotation augmentation.
+        Get a single sample with aggressive augmentation.
 
         Returns:
-            Dict containing:
-                - traces: [N, 4] tensor of (x, y, z, t)
-                - trace_mask: [N] bool mask (all True before padding)
-                - boxes: [M, 6] tensor of (cx, cy, cz, sx, sy, sz)
-                - labels: [M] tensor of label IDs
-                - valid_mask: [M] bool mask (True for real colliders, False for padding)
-                - num_traces: scalar tensor
-                - num_colliders: scalar tensor
-                - filename: string
-                - rotation: rotation angle applied
+            Dict containing augmented traces and colliders
         """
         pair = self.data_pairs[idx]
         rotation_angle = pair['rotation']
@@ -246,10 +332,8 @@ class TraceColliderDataset(Dataset):
         with open(pair['collider'], 'r') as f:
             collider_data = json.load(f)
 
-        # Extract traces (should be a list of dicts)
+        # Extract traces and colliders
         traces = trace_data if isinstance(trace_data, list) else []
-
-        # Extract colliders
         colliders = collider_data.get('colliders', [])
 
         # Apply rotation augmentation
@@ -257,16 +341,33 @@ class TraceColliderDataset(Dataset):
             traces = self._rotate_traces(traces, rotation_angle)
             colliders = self._rotate_colliders(colliders, rotation_angle)
 
+        # Apply random translation (simulates different room positions)
+        if self.augment_translation:
+            tx = np.random.uniform(-self.translation_range, self.translation_range)
+            tz = np.random.uniform(-self.translation_range, self.translation_range)
+            traces = self._translate_traces(traces, tx, tz)
+            colliders = self._translate_colliders(colliders, tx, tz)
+
+        # Apply random scaling (simulates different room sizes)
+        if self.augment_scale:
+            scale = np.random.uniform(*self.scale_range)
+            traces = self._scale_traces(traces, scale)
+            colliders = self._scale_colliders(colliders, scale)
+
+        # Apply collider dropout (simulates missing/partial observations)
+        if self.augment_collider_dropout and np.random.rand() < 0.5:
+            colliders = self._dropout_colliders(colliders, self.collider_dropout_prob)
+
         # Process data
         trace_array = self._process_traces(traces)
         collider_boxes, collider_labels, collider_valid = self._process_colliders(colliders)
 
         return {
-            'traces': trace_array,  # [N, 4]
+            'traces': trace_array,
             'trace_mask': torch.ones(len(trace_array), dtype=torch.bool),
-            'boxes': collider_boxes,  # [M, 6]
-            'labels': collider_labels,  # [M]
-            'valid_mask': collider_valid,  # [M]
+            'boxes': collider_boxes,
+            'labels': collider_labels,
+            'valid_mask': collider_valid,
             'num_traces': torch.tensor(len(traces), dtype=torch.long),
             'num_colliders': torch.tensor(len(colliders), dtype=torch.long),
             'filename': f"{pair['trace'].name}_rot{rotation_angle}",
@@ -419,23 +520,35 @@ def create_dataloader(
         batch_size: int = 4,
         shuffle: bool = True,
         num_workers: int = 0,
-        max_trace_len: int = 3000,  # Reduced from 5000 for better performance
+        max_trace_len: int = 3000,
         max_colliders: int = 50,
         augment_rotation: bool = True,
-        rotation_angles: list = [0, 90, 180, 270]
+        augment_translation: bool = True,
+        augment_scale: bool = True,
+        augment_collider_dropout: bool = True,
+        rotation_angles: list = [0, 90, 180, 270],
+        scale_range: tuple = (0.8, 1.2),
+        translation_range: float = 1.0,
+        collider_dropout_prob: float = 0.2
 ) -> DataLoader:
     """
-    Create dataloader for trace-collider dataset.
+    Create dataloader with aggressive augmentation.
 
     Args:
-        data_dir: Path to dataset directory containing *_trace.json and *_collider.json
+        data_dir: Path to dataset directory
         batch_size: Batch size
         shuffle: Whether to shuffle data
-        num_workers: Number of worker processes for data loading
-        max_trace_len: Maximum trace length (longer traces are downsampled)
-        max_colliders: Maximum number of colliders per scene
-        augment_rotation: If True, apply rotation augmentation
-        rotation_angles: List of rotation angles in degrees (e.g., [0, 90, 180, 270])
+        num_workers: Number of worker processes
+        max_trace_len: Maximum trace length
+        max_colliders: Maximum number of colliders
+        augment_rotation: Enable rotation augmentation
+        augment_translation: Enable random translation
+        augment_scale: Enable random scaling
+        augment_collider_dropout: Enable random collider dropout
+        rotation_angles: List of rotation angles (e.g., [0, 90, 180, 270])
+        scale_range: (min_scale, max_scale) for random scaling
+        translation_range: Maximum translation in meters
+        collider_dropout_prob: Probability of dropping each collider
 
     Returns:
         DataLoader instance
@@ -445,7 +558,13 @@ def create_dataloader(
         max_trace_len=max_trace_len,
         max_colliders=max_colliders,
         augment_rotation=augment_rotation,
-        rotation_angles=rotation_angles
+        augment_translation=augment_translation,
+        augment_scale=augment_scale,
+        augment_collider_dropout=augment_collider_dropout,
+        rotation_angles=rotation_angles,
+        scale_range=scale_range,
+        translation_range=translation_range,
+        collider_dropout_prob=collider_dropout_prob
     )
 
     loader = DataLoader(

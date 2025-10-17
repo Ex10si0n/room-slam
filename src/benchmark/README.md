@@ -56,6 +56,48 @@ room-slam/
 - `MID`: Medium-height furniture (tables, desks)
 - `HIGH`: High obstacles
 
+## Data Augmentation
+
+**Aggressive Multi-Modal Augmentation**: To prevent overfitting and force the model to learn true trace→collider mapping (not memorization), the dataloader applies multiple augmentation strategies:
+
+### 1. **Rotation Augmentation** (4x multiplier)
+- **0°**: Original orientation
+- **90°**: Rotated clockwise
+- **180°**: Rotated 180°
+- **270°**: Rotated counter-clockwise
+
+### 2. **Translation Augmentation**
+- Random shift in X-Z plane: ±1.0 meters
+- Simulates different room positions
+- Forces model to learn relative spatial relationships
+
+### 3. **Scale Augmentation**
+- Random scaling: 0.8x to 1.2x
+- Simulates different room sizes
+- Prevents memorizing absolute positions
+- Both traces and colliders scaled proportionally
+
+### 4. **Collider Dropout** (Critical!)
+- Randomly drops 20% of colliders (except walls)
+- Forces model to infer from traces, not just copy GT
+- Prevents "output all colliders regardless of input" behavior
+- Walls (large BLOCK colliders) are always kept
+
+**Combined Effect**: These augmentations effectively create **infinite variations** of the same scene, preventing overfitting even with limited data from a single room.
+
+**Why This Works**:
+- Model can't memorize fixed outputs anymore
+- Must learn: "Where do traces avoid? → Place colliders there"
+- Different scales/translations mean absolute positions are useless
+- Collider dropout means model must predict from trace patterns
+
+**Test augmentation:**
+```bash
+python test_augmentation.py
+```
+
+This generates `augmentation_test.png` showing all 4 rotated versions side-by-side.
+
 ## Installation
 
 ```bash
@@ -79,19 +121,23 @@ pip install -r requirements.txt
 ```bash
 # Test dataloader and view dataset statistics
 python dataloader.py ../../dataset
+
+# Test rotation augmentation
+python test_augmentation.py
 ```
 
 **Output:**
 ```
-Found 7 samples in ../../dataset
+Found 7 base samples in ../../dataset
+Augmented to 28 samples with rotations: [0, 90, 180, 270]°
 Dataset Statistics:
-  Total samples: 7
+  Total samples: 28 (7 base × 4 rotations)
   Avg traces per sample: 8,500.5
   Avg colliders per sample: 11.2
   Label distribution:
-    BLOCK: 450
-    LOW: 120
-    MID: 80
+    BLOCK: 1800 (450 × 4)
+    LOW: 480 (120 × 4)
+    MID: 320 (80 × 4)
 ```
 
 ### 2. Train Model
@@ -108,14 +154,37 @@ python train.py
 - Loss: Classification + L1 + GIoU
 - Optimizer: AdamW with cosine LR decay
 - Device: Automatic CUDA detection
+- **Data Augmentation**: 
+  - Rotation: 4x (0°, 90°, 180°, 270°)
+  - Translation: Random ±1.0m
+  - Scale: Random 0.8x-1.2x
+  - Collider Dropout: 20%
 
 **Training Progress:**
 ```
+Found 7 base samples in ../../dataset
+Augmented to 28 samples with rotations: [0, 90, 180, 270]°
+Using device: cuda (NVIDIA Tesla T4)
+Total trainable parameters: 2,984,582
+
+=== Data Augmentation Settings ===
+Rotation: [0°, 90°, 180°, 270°]
+Translation: ±1.0 meters
+Scale: 0.8x to 1.2x
+Collider Dropout: 20% probability
+========================================
+
 Epoch 0: loss=5.234, cls=1.234, l1=2.000, giou=2.000, LR=0.000020
 Epoch 10: loss=3.456, cls=0.789, l1=1.567, giou=1.100, LR=0.000200
 ...
 Saved best model with loss 1.234
 ```
+
+**Why Aggressive Augmentation Matters**:
+- Prevents overfitting to single room layout
+- Forces model to learn from trace patterns, not memorize positions
+- Enables generalization to unseen scenes
+- Collider dropout is critical: model must predict from traces, not just copy GT
 
 Models are saved in `./checkpoints/`:
 - `best_model.pth`: Best validation loss
@@ -255,6 +324,12 @@ This eliminates duplicate predictions and improves precision.
 - Lower learning rate to 1e-4
 - Increase batch size
 
+**Q: Model outputs same predictions for different traces (overfitting)?**
+- ✅ **Solution**: Use rotation augmentation (enabled by default)
+- Verify augmentation is working: `python test_augmentation.py`
+- Check that training dataset shows "Augmented to X samples with rotations"
+- Test on truly different scenes if available
+
 **Q: Too many overlapping predictions?**
 - Lower `--nms` threshold (0.3 → 0.2)
 - Increase `--threshold` (0.7 → 0.8)
@@ -287,9 +362,44 @@ This eliminates duplicate predictions and improves precision.
 
 ## Advanced Features
 
+### Disable Augmentation (for testing/debugging)
+
+If you need to disable rotation augmentation:
+
+```python
+# In dataloader.py or train.py
+train_loader = create_dataloader(
+    config['data_dir'],
+    batch_size=config['batch_size'],
+    shuffle=True,
+    augment_rotation=False,  # Disable augmentation
+    rotation_angles=[0]       # Only use original orientation
+)
+```
+
+### Custom Augmentation Angles
+
+You can customize rotation angles:
+
+```python
+# Use only 0° and 180° (2x augmentation)
+train_loader = create_dataloader(
+    config['data_dir'],
+    augment_rotation=True,
+    rotation_angles=[0, 180]
+)
+
+# Use 8 angles (45° increments, 8x augmentation)
+train_loader = create_dataloader(
+    config['data_dir'],
+    augment_rotation=True,
+    rotation_angles=[0, 45, 90, 135, 180, 225, 270, 315]
+)
+```
+
 ### Custom Data Augmentation
 
-Add to `dataloader.py`:
+Add additional augmentations to `dataloader.py`:
 ```python
 # Random rotation around Y-axis
 angle = np.random.uniform(-np.pi/6, np.pi/6)

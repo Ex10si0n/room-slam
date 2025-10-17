@@ -275,7 +275,7 @@ def main():
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,
-        'data_dir': '../../dataset/train',
+        'data_dir': '../../dataset',
         'save_dir': './checkpoints',
         'warmup_epochs': 10  # Warmup for stable training
     }
@@ -287,13 +287,26 @@ def main():
     with open(Path(config['save_dir']) / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
-    # Create dataloaders with rotation augmentation
+    # Create dataloaders with AGGRESSIVE augmentation
+    print("\n=== Data Augmentation Settings ===")
+    print("Rotation: [0°, 90°, 180°, 270°]")
+    print("Translation: ±1.0 meters")
+    print("Scale: 0.8x to 1.2x")
+    print("Collider Dropout: 20% probability")
+    print("=" * 40 + "\n")
+
     train_loader = create_dataloader(
         config['data_dir'],
         batch_size=config['batch_size'],
         shuffle=True,
-        augment_rotation=True,  # Enable rotation augmentation
-        rotation_angles=[0, 90, 180, 270]  # 4x data augmentation
+        augment_rotation=True,
+        augment_translation=True,  # NEW: Random translation
+        augment_scale=True,  # NEW: Random scaling
+        augment_collider_dropout=True,  # NEW: Random collider dropout
+        rotation_angles=[0, 90, 180, 270],
+        scale_range=(0.8, 1.2),
+        translation_range=1.0,
+        collider_dropout_prob=0.2
     )
 
     # Build model
