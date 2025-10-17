@@ -13,7 +13,7 @@ def load_model(checkpoint_path: str, device):
     model = build_model(
         num_queries=config.get('num_queries', 50),
         d_model=config.get('d_model', 256),
-        model_type=config.get('model_type', 'lstm')
+        model_type=config.get('model_type', 'transformer')
     )
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
