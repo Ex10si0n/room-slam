@@ -364,9 +364,9 @@ def main():
 
     # Hyperparameters (optimized for training)
     config = {
-        'batch_size': 4,
+        'batch_size': 20,
         'num_epochs': 200,
-        'lr': 2e-4,
+        'lr': 1e-3,
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,
@@ -469,7 +469,6 @@ def main():
             val_loss = validate(model, val_loader, criterion, device)
             metrics = evaluate_metrics(model, val_loader, device, iou_thresh=config['iou_thresh'])
 
-            # 用验证损失驱动 scheduler（ReduceLROnPlateau 的用法）
             scheduler.step(val_loss)
 
             print(f"Epoch {epoch}: Train {train_loss:.4f} | Val {val_loss:.4f} | "
@@ -491,7 +490,6 @@ def main():
                 print(f"✓ Saved BEST model (val_loss={best_val_loss:.4f})")
 
         else:
-            # 没有验证时也要更新打印 LR
             print(f"Epoch {epoch}: Train {train_loss:.4f} | "
                   f"LR={optimizer.param_groups[0]['lr']:.6f} (no val this epoch)")
 
