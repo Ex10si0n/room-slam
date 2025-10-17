@@ -1,7 +1,8 @@
 import torch
 import json
+from pathlib import Path
 import argparse
-from src.benchmark.model import build_model
+from model import build_model
 
 
 def load_model(checkpoint_path: str, device):
@@ -86,7 +87,17 @@ def predict(model, traces_file, device, confidence_threshold=0.5):
     with open(traces_file, 'r') as f:
         data = json.load(f)
 
-    traces = data.get('traces', data.get('trajectory', []))
+    # Handle both formats:
+    # 1. Direct list: [{x, y, z, timestamp}, ...]
+    # 2. Dict with traces: {"traces": [...]}
+    if isinstance(data, list):
+        traces = data
+    else:
+        traces = data.get('traces', data.get('trajectory', []))
+
+    if len(traces) == 0:
+        print("Warning: No traces found in file")
+        return []
 
     # Process traces
     trace_tensor = process_traces(traces).unsqueeze(0).to(device)  # [1, N, 4]
@@ -118,9 +129,13 @@ def main():
                         help='Confidence threshold')
     args = parser.parse_args()
 
-    # Setup device
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Setup device - use CUDA
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
+    else:
+        device = torch.device("cpu")
+        print(f"CUDA not available, using CPU")
 
     # Load model
     print(f"Loading model from {args.checkpoint}")

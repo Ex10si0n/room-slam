@@ -216,9 +216,17 @@ def count_parameters(model):
 
 
 if __name__ == "__main__":
+    # Setup device
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
+    else:
+        device = torch.device("cpu")
+        print("CUDA not available, using CPU")
+
     # Test model
-    print("Building lightweight model...")
-    model = build_model()
+    print("\nBuilding lightweight model...")
+    model = build_model().to(device)
 
     # Count parameters
     num_params = count_parameters(model)
@@ -229,8 +237,8 @@ if __name__ == "__main__":
     print("\nTesting forward pass...")
     batch_size = 2
     seq_len = 1000
-    traces = torch.randn(batch_size, seq_len, 4)
-    mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    traces = torch.randn(batch_size, seq_len, 4).to(device)
+    mask = torch.ones(batch_size, seq_len, dtype=torch.bool).to(device)
 
     output = model(traces, mask)
 
@@ -243,5 +251,9 @@ if __name__ == "__main__":
     print(f"  Input: ~{batch_size * seq_len * 4 * 4 / 1024 / 1024:.2f} MB")
     print(f"  Model: ~{num_params * 4 / 1024 / 1024:.1f} MB")
     print(f"  Output: ~{batch_size * 30 * 10 * 4 / 1024:.2f} MB")
+
+    if torch.cuda.is_available():
+        print(f"\nGPU Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024:.2f} MB")
+        print(f"GPU Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024:.2f} MB")
 
     print("\n✓ Model test passed!")
