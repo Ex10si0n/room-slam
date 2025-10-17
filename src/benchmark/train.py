@@ -364,9 +364,9 @@ def main():
 
     # Hyperparameters (optimized for training)
     config = {
-        'batch_size': 20,
+        'batch_size': 5,
         'num_epochs': 200,
-        'lr': 1e-3,
+        'lr': 2e-4,
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,

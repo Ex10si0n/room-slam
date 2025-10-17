@@ -249,33 +249,19 @@ class TraceToColliderTransformer(nn.Module):
             'pred_classes': classes  # [B, Q, 4] class logits
         }
 
-def build_model(num_queries: int = 30, d_model: int = 128):
+def build_model(num_queries: int = 60, d_model: int = 256):
     """
-    Build lightweight model for M4 24GB.
+    Build a larger model for higher capacity.
 
-    Reduced parameters:
-    - d_model: 256 -> 128
-    - num_encoder_layers: 6 -> 3
-    - num_decoder_layers: 6 -> 3
-    - nhead: 8 -> 4
-    - dim_feedforward: 1024 -> 512
-    - num_queries: 50 -> 30
-
-    Args:
-        num_queries: Number of object queries (max detections per scene)
-        d_model: Model dimension
-
-    Returns:
-        TraceToColliderTransformer model
+    These bumps increase both representation power and the maximum #detections.
     """
     model = TraceToColliderTransformer(
         d_model=d_model,
-        nhead=4,
-        num_encoder_layers=3,
-        num_decoder_layers=3,
+        nhead=8,
+        num_encoder_layers=6,
+        num_decoder_layers=6,
         num_queries=num_queries
     )
-
     return model
 
 
