@@ -5,11 +5,12 @@ from typing import Optional
 
 
 class PositionalEncoding(nn.Module):
-    """3D + Temporal positional encoding"""
+    """3D + Temporal positional encoding with dynamic length support"""
 
-    def __init__(self, d_model: int, max_len: int = 5000):
+    def __init__(self, d_model: int, max_len: int = 20000):
         super().__init__()
         self.d_model = d_model
+        self.max_len = max_len
 
         # Standard sinusoidal encoding
         pe = torch.zeros(max_len, d_model)
@@ -23,7 +24,25 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, N, D]
-        return x + self.pe[:x.size(1), :].unsqueeze(0)
+        seq_len = x.size(1)
+
+        # If sequence is longer than max_len, extend positional encoding
+        if seq_len > self.max_len:
+            self._extend_pe(seq_len, x.device)
+
+        return x + self.pe[:seq_len, :].unsqueeze(0)
+
+    def _extend_pe(self, new_len: int, device):
+        """Dynamically extend positional encoding if needed"""
+        pe = torch.zeros(new_len, self.d_model, device=device)
+        position = torch.arange(0, new_len, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, device=device).float() *
+                             (-math.log(10000.0) / self.d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+        self.max_len = new_len
 
 
 class TraceEncoder(nn.Module):

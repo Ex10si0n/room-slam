@@ -3,12 +3,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import numpy as np
 import argparse
-
-
-def load_data(filepath):
-    """Load trace and collider data"""
-    with open(filepath, 'r') as f:
-        return json.load(f)
+from pathlib import Path
 
 
 def plot_top_view(traces, colliders, predictions=None, title="Top View"):
@@ -135,14 +130,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', type=str, required=True,
                         help='Input data file (JSON with traces and colliders)')
+    parser.add_argument('--colliders', type=str, default=None,
+                        help='Separate colliders file (optional)')
     parser.add_argument('--predictions', type=str, default=None,
                         help='Prediction file (optional)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output image file')
     args = parser.parse_args()
 
-    # Load data
-    data = load_data(args.input)
+    # Load trace data
+    with open(args.input, 'r') as f:
+        data = json.load(f)
 
     # Handle both formats for traces
     if isinstance(data, list):
@@ -152,25 +150,36 @@ def main():
         traces = data.get('traces', data.get('trajectory', []))
         colliders = data.get('colliders', [])
 
+    # Load separate colliders file if provided
+    if args.colliders:
+        with open(args.colliders, 'r') as f:
+            collider_data = json.load(f)
+            if isinstance(collider_data, dict):
+                colliders = collider_data.get('colliders', [])
+            else:
+                colliders = collider_data
+
+    # Load predictions
     predictions = None
     if args.predictions:
-        pred_data = load_data(args.predictions)
-        predictions = pred_data.get('colliders', [])
+        with open(args.predictions, 'r') as f:
+            pred_data = json.load(f)
+            predictions = pred_data.get('colliders', [])
 
     # Create plots
     fig_top = plot_top_view(traces, colliders, predictions,
-                            title=f"Top View - {args.input}")
+                            title=f"Top View - {Path(args.input).name}")
 
-    if any('y' in p for p in traces):
+    if traces and any('y' in p for p in traces):
         fig_side = plot_side_view(traces, colliders, predictions,
-                                  title=f"Side View - {args.input}")
+                                  title=f"Side View - {Path(args.input).name}")
 
     # Save or show
     if args.output:
         fig_top.savefig(args.output, dpi=150, bbox_inches='tight')
         print(f"Saved visualization to {args.output}")
 
-        if any('y' in p for p in traces):
+        if traces and any('y' in p for p in traces):
             side_output = args.output.replace('.png', '_side.png')
             fig_side.savefig(side_output, dpi=150, bbox_inches='tight')
             print(f"Saved side view to {side_output}")

@@ -295,7 +295,7 @@ def create_dataloader(
         batch_size: int = 4,
         shuffle: bool = True,
         num_workers: int = 0,
-        max_trace_len: int = 5000,
+        max_trace_len: int = 3000,  # Reduced from 5000 for better performance
         max_colliders: int = 50
 ) -> DataLoader:
     """

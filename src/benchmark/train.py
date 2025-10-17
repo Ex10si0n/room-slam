@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from scipy.optimize import linear_sum_assignment
+import numpy as np
 from pathlib import Path
 import json
 from tqdm import tqdm
@@ -62,7 +62,7 @@ class HungarianMatcher:
 
 
 class SetCriterion(nn.Module):
-    """Loss computation"""
+    """Loss computation with GIoU"""
 
     def __init__(self, weight_dict):
         super().__init__()
@@ -70,7 +70,41 @@ class SetCriterion(nn.Module):
         self.matcher = HungarianMatcher()
 
         self.class_loss = nn.CrossEntropyLoss()
-        self.box_loss = nn.L1Loss()
+        self.l1_loss = nn.L1Loss(reduction='none')
+
+    def box_iou_3d(self, boxes1, boxes2):
+        """Compute 3D IoU between boxes"""
+        # boxes: [N, 6] (cx, cy, cz, sx, sy, sz)
+
+        # Convert to corner format
+        boxes1_min = boxes1[:, :3] - boxes1[:, 3:] / 2
+        boxes1_max = boxes1[:, :3] + boxes1[:, 3:] / 2
+        boxes2_min = boxes2[:, :3] - boxes2[:, 3:] / 2
+        boxes2_max = boxes2[:, :3] + boxes2[:, 3:] / 2
+
+        # Intersection
+        inter_min = torch.maximum(boxes1_min, boxes2_min)
+        inter_max = torch.minimum(boxes1_max, boxes2_max)
+        inter_size = torch.clamp(inter_max - inter_min, min=0)
+        inter_volume = inter_size.prod(dim=1)
+
+        # Union
+        boxes1_volume = boxes1[:, 3:].prod(dim=1)
+        boxes2_volume = boxes2[:, 3:].prod(dim=1)
+        union_volume = boxes1_volume + boxes2_volume - inter_volume
+
+        # IoU
+        iou = inter_volume / (union_volume + 1e-6)
+
+        # GIoU: need enclosing box
+        enclosing_min = torch.minimum(boxes1_min, boxes2_min)
+        enclosing_max = torch.maximum(boxes1_max, boxes2_max)
+        enclosing_size = torch.clamp(enclosing_max - enclosing_min, min=0)
+        enclosing_volume = enclosing_size.prod(dim=1)
+
+        giou = iou - (enclosing_volume - union_volume) / (enclosing_volume + 1e-6)
+
+        return iou, giou
 
     def forward(self, outputs, targets):
         pred_boxes = outputs['pred_boxes']
@@ -89,12 +123,13 @@ class SetCriterion(nn.Module):
         class_loss = self._compute_class_loss(pred_classes, gt_labels, gt_valid_mask, indices)
         losses['class_loss'] = class_loss
 
-        # Box regression loss
-        box_loss = self._compute_box_loss(pred_boxes, gt_boxes, gt_valid_mask, indices)
-        losses['box_loss'] = box_loss
+        # Box regression loss (L1 + GIoU)
+        l1_loss, giou_loss = self._compute_box_loss(pred_boxes, gt_boxes, gt_valid_mask, indices)
+        losses['l1_loss'] = l1_loss
+        losses['giou_loss'] = giou_loss
 
         # Total loss
-        total_loss = sum(losses[k] * self.weight_dict[k] for k in losses.keys())
+        total_loss = sum(losses[k] * self.weight_dict.get(k, 1.0) for k in losses.keys())
         losses['total_loss'] = total_loss
 
         return losses
@@ -137,12 +172,19 @@ class SetCriterion(nn.Module):
                 target_list.append(valid_boxes[gt_idx])
 
         if len(pred_list) == 0:
-            return torch.tensor(0.0, device=device)
+            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
         pred_cat = torch.cat(pred_list, dim=0)
         target_cat = torch.cat(target_list, dim=0)
 
-        return self.box_loss(pred_cat, target_cat)
+        # L1 loss
+        l1_loss = self.l1_loss(pred_cat, target_cat).mean()
+
+        # GIoU loss
+        _, giou = self.box_iou_3d(pred_cat, target_cat)
+        giou_loss = (1 - giou).mean()
+
+        return l1_loss, giou_loss
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
@@ -182,8 +224,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         total_loss += loss.item()
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
-            'class': f"{losses['class_loss'].item():.4f}",
-            'box': f"{losses['box_loss'].item():.4f}"
+            'cls': f"{losses['class_loss'].item():.4f}",
+            'l1': f"{losses['l1_loss'].item():.4f}",
+            'giou': f"{losses['giou_loss'].item():.4f}"
         })
 
     return total_loss / len(dataloader)
@@ -224,16 +267,17 @@ def main():
         device = torch.device("cpu")
         print(f"CUDA not available, using CPU")
 
-    # Hyperparameters (optimized for M4 24GB)
+    # Hyperparameters (optimized for training)
     config = {
-        'batch_size': 2,  # Reduced for memory
-        'num_epochs': 100,
-        'lr': 1e-4,
+        'batch_size': 4,  # Increased from 2 (GPU can handle more)
+        'num_epochs': 200,  # More epochs for better convergence
+        'lr': 2e-4,  # Slightly higher initial LR
         'weight_decay': 1e-4,
-        'd_model': 128,  # Reduced from 256
-        'num_queries': 30,  # Reduced from 50
+        'd_model': 128,
+        'num_queries': 30,
         'data_dir': '../../dataset',
-        'save_dir': './checkpoints'
+        'save_dir': './checkpoints',
+        'warmup_epochs': 10  # Warmup for stable training
     }
 
     # Create save directory
@@ -261,7 +305,11 @@ def main():
     print(f"Model parameters: {num_params:,}")
 
     # Loss and optimizer
-    weight_dict = {'class_loss': 1.0, 'box_loss': 5.0}
+    weight_dict = {
+        'class_loss': 2.0,  # Increased class loss weight
+        'l1_loss': 5.0,  # L1 box loss
+        'giou_loss': 2.0  # GIoU loss for better localization
+    }
     criterion = SetCriterion(weight_dict)
 
     optimizer = AdamW(
@@ -270,11 +318,15 @@ def main():
         weight_decay=config['weight_decay']
     )
 
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=config['num_epochs'],
-        eta_min=1e-6
-    )
+    # Learning rate scheduler with warmup
+    def lr_lambda(epoch):
+        if epoch < config['warmup_epochs']:
+            return (epoch + 1) / config['warmup_epochs']
+        else:
+            return 0.5 * (1 + np.cos(np.pi * (epoch - config['warmup_epochs']) /
+                                     (config['num_epochs'] - config['warmup_epochs'])))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Training loop
     best_loss = float('inf')
