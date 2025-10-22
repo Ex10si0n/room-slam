@@ -128,15 +128,19 @@ class TraceColliderAlignmentLoss(nn.Module):
         point_to_box_dist = inside_margin.sum(dim=-1)  # [B, N, Q]
 
         # Weight by passability
-        weighted_dist = point_to_box_dist * passable_probs.unsqueeze(1)  # [B, N, Q]
+        weighted_dist_t2b = point_to_box_dist * passable_probs.unsqueeze(1)  # [B, N, Q]
+        min_dist_t2b, _ = weighted_dist_t2b.min(dim=-1)  # [B, N]
+        valid_dists_t2b = min_dist_t2b * trace_mask
+        loss_t2b = valid_dists_t2b.sum() / (trace_mask.sum() + 1e-6)
 
         # For each trace point, find minimum weighted distance
-        min_dist, _ = weighted_dist.min(dim=-1)  # [B, N]
+        min_dist_b2t, _ = point_to_box_dist.min(dim=1)  # [B, Q]
 
         # Apply mask and normalize
-        valid_dists = min_dist * trace_mask
-        coverage_loss = valid_dists.sum() / (trace_mask.sum() + 1e-6)
+        weighted_dist_b2t = min_dist_b2t * passable_probs # [B, Q]
+        loss_b2t = weighted_dist_b2t.sum() / (passable_probs.sum() + 1e-6)
 
+        coverage_loss = loss_t2b + loss_b2t
         return coverage_loss
 
     def compute_avoidance_loss(
@@ -641,10 +645,10 @@ def main():
 
     weight_dict = {
         'class_loss': 2.0,
-        'l1_loss': 2.0,
+        'l1_loss': 5.0,
         'giou_loss': 2.0,
         'coverage_loss': 3.0,
-        'avoidance_loss': 3.0
+        'avoidance_loss': 5.0
     }
     criterion = SetCriterion(weight_dict)
 
