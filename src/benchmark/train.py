@@ -640,11 +640,11 @@ def main():
     print(f"Model parameters: {num_params:,}")
 
     weight_dict = {
-        'class_loss': 0.0,
-        'l1_loss': 0.0,
-        'giou_loss': 0.0,
-        'coverage_loss': 1.5,
-        'avoidance_loss': 3.0
+        'class_loss': 1.0,
+        'l1_loss': 2.0,
+        'giou_loss': 1.0,
+        'coverage_loss': 10.0,
+        'avoidance_loss': 15.0
     }
     criterion = SetCriterion(weight_dict)
 
