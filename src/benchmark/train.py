@@ -640,9 +640,9 @@ def main():
     print(f"Model parameters: {num_params:,}")
 
     weight_dict = {
-        'class_loss': 2.0,
-        'l1_loss': 5.0,
-        'giou_loss': 2.0,
+        'class_loss': 0.0,
+        'l1_loss': 0.0,
+        'giou_loss': 0.0,
         'coverage_loss': 1.5,
         'avoidance_loss': 3.0
     }
