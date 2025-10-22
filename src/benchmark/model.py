@@ -1,13 +1,12 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 
 class LSTMTraceEncoder(nn.Module):
-    """
-    Encode trace sequences with a BiLSTM.
-    """
+    """Encode trace sequences with a BiLSTM."""
 
     def __init__(self, input_dim: int = 11, d_model: int = 128, num_layers: int = 2, dropout: float = 0.1):
         super().__init__()
@@ -23,55 +22,41 @@ class LSTMTraceEncoder(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        """
-        Args:
-            traces: [B, N, 11] with (x,y,z,t, vx,vy,vz, ax,ay,az, speed)
-            mask:   [B, N] boolean; True means valid token
-
-        Returns:
-            memory: [B, N, D] BiLSTM features
-            coords: [B, N, 3] raw xyz
-            mean:   [B, 1, 3] per-batch mean over valid coords
-            scale:  [B, 1, 1] per-batch RMS scale (x,z)
-        """
-
-        # Extract shapes and raw coordinates
         B, N, _ = traces.shape
         coords = traces[..., :3].contiguous()
 
-        # Handle masking of invalid / padded timesteps:
         valid = mask if mask is not None else torch.ones((B, N), dtype=torch.bool, device=traces.device)
-        denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)  # [B,1,1]
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
 
-        # Compute per-sequence coordinate statistics for normalization:
         mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
         centered = (coords - mean) * valid.unsqueeze(-1)
         rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
         scale = rms
 
-        # Project raw 11D features -> d_model
-        x = self.input_proj(traces)  # [B,N,D]
-
-        # Run bidirectional LSTM over the sequence
-        memory, _ = self.lstm(x)  # [B,N,D]
-
-        # Apply a final linear projection for dimension alignment.
+        x = self.input_proj(traces)
+        memory, _ = self.lstm(x)
         memory = self.out_proj(memory)
 
         return memory, coords, mean, scale
 
 
 class SimpleQueryDecoder(nn.Module):
-    """
-    Query-based set decoder without a Transformer, BiLSTM in this case.
-    """
 
     def __init__(self, d_model: int = 128, num_queries: int = 30):
         super().__init__()
         self.num_queries = num_queries
         self.query_embed = nn.Embedding(num_queries, d_model)
 
-        # Linear projections for attention
+        self.context_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.context_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(6, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
+        )
+
+        # Attention
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -82,89 +67,94 @@ class SimpleQueryDecoder(nn.Module):
         self.size_head = MLP(d_model, d_model, 3, 2)
         self.class_head = nn.Linear(d_model, 3)
 
-        # FiLM from global memory summary
-        self.gamma_mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
-        self.beta_mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+        self.gamma_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, d_model)
+        )
+        self.beta_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, d_model)
+        )
 
-        # Learnable attention temperature
         self.inv_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(
             self,
-            memory: torch.Tensor,  # [B,N,D]
-            coords: torch.Tensor,  # [B,N,3]
-            mean: torch.Tensor,  # [B,1,3]
-            scale: torch.Tensor,  # [B,1,1]
-            memory_mask: Optional[torch.Tensor] = None  # [B,N] True for valid
+            memory: torch.Tensor,
+            coords: torch.Tensor,
+            mean: torch.Tensor,
+            scale: torch.Tensor,
+            memory_mask: Optional[torch.Tensor] = None
     ):
-        """
-        Args:
-            memory: [B, N, D] encoded features
-            coords: [B, N, 3] raw (x,y,z) of traces
-            mean:   [B, 1, 3] mean of valid coords
-            scale:  [B, 1, 1] scale of
-            memory_mask: [B, N] True for valid
-        Returns:
-            boxes:   [B, Q, 6] absolute boxes (cx,cy,cz,sx,sy,sz)
-            classes: [B, Q, 3] class logits
-        """
         B, N, D = memory.shape
 
-        base_queries = self.query_embed.weight.unsqueeze(0)  # [1,Q,D]
+        base_queries = self.query_embed.weight.unsqueeze(0)
 
-        # Compute global context from memory
+        context_query = self.context_query.expand(B, -1, -1)
+        key_padding_mask = ~memory_mask if memory_mask is not None else None
+        global_context, _ = self.context_attn(
+            context_query, memory, memory,
+            key_padding_mask=key_padding_mask
+        )  # [B, 1, D]
+
         if memory_mask is not None:
+            valid_coords = coords * memory_mask.unsqueeze(-1)
             denom = memory_mask.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
-            global_context = (memory * memory_mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,D]
+            coord_mean = valid_coords.sum(dim=1, keepdim=True) / denom
+            centered = (coords - coord_mean) * memory_mask.unsqueeze(-1)
+            coord_var = (centered ** 2).sum(dim=1, keepdim=True) / denom
+            coord_std = torch.sqrt(coord_var + 1e-6)
         else:
-            global_context = memory.mean(dim=1, keepdim=True)
+            coord_mean = coords.mean(dim=1, keepdim=True)
+            coord_std = coords.std(dim=1, keepdim=True)
 
-        # Add trace-specific context to queries
-        queries = base_queries + global_context  # [B,Q,D] via broadcasting
+        spatial_stats = torch.cat([coord_mean, coord_std], dim=-1)  # [B, 1, 6]
+        spatial_feat = self.spatial_proj(spatial_stats)  # [B, 1, D]
 
-        # Global summary for FiLM
-        global_feat = global_context  # Reuse the same global context
+        combined_context = global_context + spatial_feat
 
-        gamma = self.gamma_mlp(global_feat)  # [B,1,D]
-        beta = self.beta_mlp(global_feat)  # [B,1,D]
+        gamma = self.gamma_mlp(combined_context)
+        beta = self.beta_mlp(combined_context)
+        queries = base_queries * (1.0 + gamma) + beta  # [B, Q, D]
 
-        # Attention over memory to get query-aligned features
-        q = self.q_proj(queries)  # [B,Q,D]
-        k = self.k_proj(memory)  # [B,N,D]
-        v = self.v_proj(memory)  # [B,N,D]
-        scores = torch.einsum('bqd,bnd->bqn', q, k) * self.inv_temp / self.scale  # [B,Q,N]
+        # Attention over memory
+        q = self.q_proj(queries)
+        k = self.k_proj(memory)
+        v = self.v_proj(memory)
+        scores = torch.einsum('bqd,bnd->bqn', q, k) * self.inv_temp / self.scale
 
         if memory_mask is not None:
-            pad = ~memory_mask  # True where padded
+            pad = ~memory_mask
             scores = scores.masked_fill(pad.unsqueeze(1), float('-inf'))
 
-        attn = torch.softmax(scores, dim=-1)  # [B,Q,N]
-        qfeat = torch.einsum('bqn,bnd->bqd', attn, v)  # [B,Q,D]
+        attn = torch.softmax(scores, dim=-1)
+        qfeat = torch.einsum('bqn,bnd->bqd', attn, v)
 
-        # Apply FiLM modulation
-        decoded = qfeat * (1.0 + gamma) + beta  # [B,Q,D]
+        # Apply FiLM again
+        decoded = qfeat * (1.0 + gamma) + beta
 
-        # Anchor from normalized coords
-        norm_coords = (coords - mean) / scale  # [B,N,3]
-        anchor_pos = torch.einsum('bqn,bnd->bqd', attn, norm_coords)  # [B,Q,3]
+        # Anchor
+        norm_coords = (coords - mean) / scale
+        anchor_pos = torch.einsum('bqn,bnd->bqd', attn, norm_coords)
 
-        delta_center = self.center_delta_head(decoded)  # [B,Q,3]
-        size_raw = self.size_head(decoded)  # [B,Q,3]
-        size_norm = torch.nn.functional.softplus(size_raw) + 1e-4
+        delta_center = self.center_delta_head(decoded)
+        size_raw = self.size_head(decoded)
+        size_norm = F.softplus(size_raw) + 1e-4
 
         center = (anchor_pos + delta_center) * scale + mean
         size = size_norm * scale
 
-        boxes = torch.cat([center, size], dim=-1)  # [B,Q,6]
-        classes = self.class_head(decoded)  # [B,Q,3]
+        boxes = torch.cat([center, size], dim=-1)
+        classes = self.class_head(decoded)
         return boxes, classes
 
 
 class TraceToColliderLSTM(nn.Module):
-    """
-    LSTM encoder + simple query decoder.
-    Produces {'pred_boxes': [B,Q,6], 'pred_classes': [B,Q,3]}.
-    """
+    """LSTM encoder + improved query decoder."""
 
     def __init__(self, d_model: int = 128, num_queries: int = 30, lstm_layers: int = 2, dropout: float = 0.1):
         super().__init__()
@@ -185,7 +175,6 @@ class PositionalEncoding(nn.Module):
         self.d_model = d_model
         self.max_len = max_len
 
-        # Standard sinusoidal encoding
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() *
@@ -196,17 +185,12 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, D]
         seq_len = x.size(1)
-
-        # If sequence is longer than max_len, extend positional encoding
         if seq_len > self.max_len:
             self._extend_pe(seq_len, x.device)
-
         return x + self.pe[:seq_len, :].unsqueeze(0)
 
     def _extend_pe(self, new_len: int, device):
-        """Dynamically extend positional encoding if needed"""
         pe = torch.zeros(new_len, self.d_model, device=device)
         position = torch.arange(0, new_len, dtype=torch.float, device=device).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, self.d_model, 2, device=device).float() *
@@ -215,16 +199,14 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
-        self.max_len = new_len
 
 
 class TransformerTraceEncoder(nn.Module):
-    """Encode traces with coordinate normalization and a Transformer encoder."""
+    """Transformer encoder for trace sequences"""
 
-    def __init__(self, input_dim: int = 11, d_model: int = 128,
-                 nhead: int = 4, num_layers: int = 3):
+    def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 3):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, d_model)
+        self.input_proj = nn.Linear(11, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -237,22 +219,11 @@ class TransformerTraceEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        """
-        Args:
-            traces: [B, N, 11] => (x,y,z,t, vx,vy,vz, ax,ay,az, speed)
-            mask:   [B, N] boolean; True for valid positions
-
-        Returns:
-            memory: [B, N, D]
-            coords: [B, N, 3]
-            mean:   [B, 1, 3]
-            scale:  [B, 1, 1]
-        """
         B, N, _ = traces.shape
-        coords = traces[..., :3].contiguous()  # [B,N,3]
+        coords = traces[..., :3].contiguous()
 
         valid = mask if mask is not None else torch.ones((B, N), dtype=torch.bool, device=traces.device)
-        denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)  # [B,1,1]
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
 
         mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
         centered = (coords - mean) * valid.unsqueeze(-1)
@@ -262,25 +233,28 @@ class TransformerTraceEncoder(nn.Module):
         x = self.input_proj(traces)
         x = self.pos_encoder(x)
 
-        pad_mask = ~valid if valid is not None else None
-        memory = self.transformer(x, src_key_padding_mask=pad_mask)
+        src_key_padding_mask = ~mask if mask is not None else None
+        memory = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
 
         return memory, coords, mean, scale
 
 
 class ColliderDecoder(nn.Module):
-    """
-    DETR-style decoder with cross-attention to memory.
-    """
 
     def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 3, num_queries: int = 30):
         super().__init__()
         self.num_queries = num_queries
-
-        # Learnable query embeddings (base patterns)
         self.query_embed = nn.Embedding(num_queries, d_model)
 
-        # Transformer decoder layers for cross-attention
+        self.context_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.context_attn = nn.MultiheadAttention(d_model, num_heads=nhead, batch_first=True)
+
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(6, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
+        )
+
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -290,82 +264,91 @@ class ColliderDecoder(nn.Module):
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # Prediction heads
         self.center_delta_head = MLP(d_model, d_model, 3, 2)
         self.size_head = MLP(d_model, d_model, 3, 2)
         self.class_head = nn.Linear(d_model, 3)
 
-        # For computing anchor positions
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
-        self.scale = d_model ** 0.5  # for dot-product attention scaling
+        self.scale = d_model ** 0.5
+
+        self.gamma_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, d_model)
+        )
+        self.beta_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, d_model)
+        )
 
     def forward(
             self,
-            memory: torch.Tensor,  # [B, N, D] encoded features
-            coords: torch.Tensor,  # [B, N, 3] raw (x,y,z) of traces
-            mean: torch.Tensor,  # [B, 1, 3] mean of valid coords
-            scale: torch.Tensor,  # [B, 1, 1] scale of
-            memory_mask: Optional[torch.Tensor] = None  # [B, N] True for valid
+            memory: torch.Tensor,
+            coords: torch.Tensor,
+            mean: torch.Tensor,
+            scale: torch.Tensor,
+            memory_mask: Optional[torch.Tensor] = None
     ):
-        """
-        Returns:
-            boxes:   [B, Q, 6] absolute boxes (cx,cy,cz,sx,sy,sz)
-            classes: [B, Q, 3] class logits
-        """
         B, N, D = memory.shape
 
-        base_queries = self.query_embed.weight.unsqueeze(0)  # [1,Q,D]
+        base_queries = self.query_embed.weight.unsqueeze(0)
 
-        # Compute global context from memory
+        context_query = self.context_query.expand(B, -1, -1)
+        key_padding_mask = ~memory_mask if memory_mask is not None else None
+        global_context, _ = self.context_attn(
+            context_query, memory, memory,
+            key_padding_mask=key_padding_mask
+        )
+
         if memory_mask is not None:
+            valid_coords = coords * memory_mask.unsqueeze(-1)
             denom = memory_mask.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
-            global_context = (memory * memory_mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,D]
+            coord_mean = valid_coords.sum(dim=1, keepdim=True) / denom
+            centered = (coords - coord_mean) * memory_mask.unsqueeze(-1)
+            coord_var = (centered ** 2).sum(dim=1, keepdim=True) / denom
+            coord_std = torch.sqrt(coord_var + 1e-6)
         else:
-            global_context = memory.mean(dim=1, keepdim=True)
+            coord_mean = coords.mean(dim=1, keepdim=True)
+            coord_std = coords.std(dim=1, keepdim=True)
 
-        # Add trace-specific context to queries
-        queries = base_queries + global_context  # [B,Q,D] via broadcasting
+        spatial_stats = torch.cat([coord_mean, coord_std], dim=-1)
+        spatial_feat = self.spatial_proj(spatial_stats)
+        combined_context = global_context + spatial_feat
 
-        # Key padding mask for transformer: True means to ignore
+        gamma = self.gamma_mlp(combined_context)
+        beta = self.beta_mlp(combined_context)
+        queries = base_queries * (1.0 + gamma) + beta
+
         mem_pad_mask = ~memory_mask if memory_mask is not None else None
-
-        # Decode query features with cross-attention over the memory
         decoded = self.transformer(
             queries,
             memory,
             memory_key_padding_mask=mem_pad_mask
-        )  # [B, Q, D]
+        )
 
-        # Compute attention weights from decoded queries to memory tokens.
-        # We do a simple dot-product attention with separate projections.
-        q = self.q_proj(decoded)  # [B, Q, D]
-        k = self.k_proj(memory)  # [B, N, D]
-        attn_scores = torch.einsum('bqd,bnd->bqn', q, k) / self.scale  # [B, Q, N]
+        q = self.q_proj(decoded)
+        k = self.k_proj(memory)
+        attn_scores = torch.einsum('bqd,bnd->bqn', q, k) / self.scale
 
         if memory_mask is not None:
-            # Mask out padded positions: set them to a very negative value
-            # memory_mask: True for valid -> we want False for padded, so invert:
-            pad = ~memory_mask  # True where padded
+            pad = ~memory_mask
             attn_scores = attn_scores.masked_fill(pad.unsqueeze(1), float('-inf'))
 
-        # normalize coords to canonical space
-        norm_coords = (coords - mean) / scale  # [B,N,3]
+        norm_coords = (coords - mean) / scale
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, norm_coords)
 
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, Q, N]
+        delta_center = self.center_delta_head(decoded)
+        size_raw = self.size_head(decoded)
+        size_norm = F.softplus(size_raw) + 1e-4
 
-        # Anchor position is the attention-weighted average of raw coords
-        anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, norm_coords)  # [B,Q,3]
-
-        # relative predictions in normalized space
-        delta_center = self.center_delta_head(decoded)  # [B,Q,3]
-        size_raw = self.size_head(decoded)  # [B,Q,3]
-        size_norm = torch.nn.functional.softplus(size_raw) + 1e-4
-
-        # denormalize back to absolute
-        center = anchor_pos + delta_center  # normalized
-        center = center * scale + mean  # absolute
-        size = size_norm * scale  # absolute (isotropic scale;也可只乘x,z)
+        center = anchor_pos + delta_center
+        center = center * scale + mean
+        size = size_norm * scale
 
         boxes = torch.cat([center, size], dim=-1)
         classes = self.class_head(decoded)
@@ -377,16 +360,13 @@ class MLP(nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int):
         super().__init__()
-
         layers = []
         for i in range(num_layers):
             in_dim = input_dim if i == 0 else hidden_dim
             out_dim = output_dim if i == num_layers - 1 else hidden_dim
-
             layers.append(nn.Linear(in_dim, out_dim))
             if i < num_layers - 1:
                 layers.append(nn.ReLU())
-
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -394,7 +374,7 @@ class MLP(nn.Module):
 
 
 class TraceToColliderTransformer(nn.Module):
-    """Trace -> relative Colliders"""
+    """Trace -> Colliders with improved decoder"""
 
     def __init__(self, d_model: int = 128, nhead: int = 4,
                  num_encoder_layers: int = 3, num_decoder_layers: int = 3,
@@ -415,22 +395,18 @@ class TraceToColliderTransformer(nn.Module):
         )
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        # Encode traces -> features and raw coordinates
-        memory, coords, mean, scale = self.encoder(traces, mask)  # memory:[B,N,D], coords:[B,N,3]
-
-        # Decode colliders with anchor-relative prediction
+        memory, coords, mean, scale = self.encoder(traces, mask)
         boxes, classes = self.decoder(memory, coords, mean, scale, mask)
-
         return {
-            'pred_boxes': boxes,  # [B, Q, 6] absolute boxes
-            'pred_classes': classes  # [B, Q, 3] class logits
+            'pred_boxes': boxes,
+            'pred_classes': classes
         }
 
 
 def build_model(
         num_queries: int = 80,
         d_model: int = 256,
-        model_type: str = "transformer",  # 'transformer' or 'lstm'
+        model_type: str = "transformer",
         nhead: int = 8,
         enc_layers: int = 6,
         dec_layers: int = 6,
@@ -438,9 +414,7 @@ def build_model(
         dropout: float = 0.1,
         lstm_layers: int = 2
 ):
-    """
-    Build model by type. Both variants output the same dict interface.
-    """
+    """Build model by type."""
     model_type = model_type.lower()
     if model_type == "transformer":
         model = TraceToColliderTransformer(
@@ -450,8 +424,8 @@ def build_model(
             num_decoder_layers=dec_layers,
             num_queries=num_queries
         )
-        print(
-            f"[build_model] Using Transformer: d_model={d_model}, heads={nhead}, enc/dec={enc_layers}/{dec_layers}, queries={num_queries}")
+        print(f"[build_model] Transformer: d_model={d_model}, heads={nhead}, "
+              f"enc/dec={enc_layers}/{dec_layers}, queries={num_queries}")
         return model
 
     elif model_type == "lstm":
@@ -461,7 +435,7 @@ def build_model(
             lstm_layers=lstm_layers,
             dropout=dropout
         )
-        print(f"[build_model] Using LSTM: d_model={d_model}, layers={lstm_layers}, queries={num_queries}")
+        print(f"[build_model] LSTM: d_model={d_model}, layers={lstm_layers}, queries={num_queries}")
         return model
 
     else:
@@ -474,32 +448,23 @@ def count_parameters(model):
 
 
 if __name__ == "__main__":
-    # Setup device
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
-    # elif torch.mps.is_available():
-    #     device = torch.device("mps")
-    #     print(f"Using device: {device} (Metal)")
     else:
         device = torch.device("cpu")
         print("CUDA not available, using CPU")
 
-    # Test model
-    print("\nBuilding lightweight model...")
-    model = build_model().to(device)
+    print("\nTesting FIXED model...")
+    model = build_model(num_queries=30, d_model=128, model_type='transformer').to(device)
 
-    # Count parameters
     num_params = count_parameters(model)
     print(f"Total trainable parameters: {num_params:,}")
-    print(f"Estimated model size: ~{num_params * 4 / 1024 / 1024:.1f} MB (FP32)")
 
-    # Test forward pass
     print("\nTesting forward pass...")
     batch_size = 2
-    seq_len = 1000
-    feat_dim = 11
-    traces = torch.randn(batch_size, seq_len, feat_dim, device=device)
+    seq_len = 500
+    traces = torch.randn(batch_size, seq_len, 11, device=device)
     mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
 
     output = model(traces, mask)
@@ -508,14 +473,26 @@ if __name__ == "__main__":
     print(f"  Boxes: {output['pred_boxes'].shape}")
     print(f"  Classes: {output['pred_classes'].shape}")
 
-    # Memory estimate
-    print(f"\nMemory estimate for batch_size={batch_size}, seq_len={seq_len}:")
-    print(f"  Input: ~{batch_size * seq_len * 4 * 4 / 1024 / 1024:.2f} MB")
-    print(f"  Model: ~{num_params * 4 / 1024 / 1024:.1f} MB")
-    print(f"  Output: ~{batch_size * 30 * 10 * 4 / 1024:.2f} MB")
+    print("\nTesting trace dependency...")
+    # Different traces with same mean
+    trace1 = torch.zeros(1, seq_len, 11, device=device)
+    trace1[0, :, 0] = torch.linspace(-2, 2, seq_len, device=device)  # horizontal
 
-    if torch.cuda.is_available():
-        print(f"\nGPU Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024:.2f} MB")
-        print(f"GPU Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024:.2f} MB")
+    trace2 = torch.zeros(1, seq_len, 11, device=device)
+    trace2[0, :, 1] = torch.linspace(-2, 2, seq_len, device=device)  # vertical
+
+    mask1 = torch.ones(1, seq_len, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        out1 = model(trace1, mask1)
+        out2 = model(trace2, mask1)
+
+    diff = (out1['pred_boxes'] - out2['pred_boxes']).abs().mean().item()
+    print(f"  Horizontal vs Vertical difference: {diff:.4f}")
+
+    if diff > 0.5:
+        print(f"PASS: Model produces different outputs for different traces!")
+    else:
+        print(f"Predictions still similar, may need more training")
 
     print("\nModel test passed!")
