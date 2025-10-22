@@ -583,7 +583,7 @@ def main():
         'num_queries': 30,
         'data_dir': '../../dataset/train',
         'val_dir': '../../dataset/val',
-        'save_dir': './checkpoints_alignment',
+        'save_dir': './checkpoints',
         'warmup_epochs': 10,
         'val_every': 1,
         'iou_thresh': 0.5
