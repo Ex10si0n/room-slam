@@ -331,7 +331,7 @@ def main():
     print("Agent vs Human Movement Data Analysis")
     print("=" * 50)
 
-    dataset_dir = "dataset"
+    dataset_dir = "dataset/val"
     if not os.path.exists(dataset_dir):
         print(f"Dataset directory '{dataset_dir}' not found!")
         return

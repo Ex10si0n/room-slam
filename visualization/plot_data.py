@@ -15,7 +15,7 @@ import glob
 class RealDataPlotter:
     """Plotter for real dataset with 3D movement traces and colliders"""
 
-    def __init__(self, dataset_dir: str = "dataset"):
+    def __init__(self, dataset_dir: str = "dataset/val"):
         self.dataset_dir = dataset_dir
         self.movement_files = []
         self.colliders_data = None

@@ -109,14 +109,21 @@ class SimpleQueryDecoder(nn.Module):
             classes: [B, Q, 3] class logits
         """
         B, N, D = memory.shape
-        queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B,Q,D]
 
-        # Global summary for FiLM
+        base_queries = self.query_embed.weight.unsqueeze(0)  # [1,Q,D]
+
+        # Compute global context from memory
         if memory_mask is not None:
             denom = memory_mask.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
-            global_feat = (memory * memory_mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,D]
+            global_context = (memory * memory_mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,D]
         else:
-            global_feat = memory.mean(dim=1, keepdim=True)
+            global_context = memory.mean(dim=1, keepdim=True)
+
+        # Add trace-specific context to queries
+        queries = base_queries + global_context  # [B,Q,D] via broadcasting
+
+        # Global summary for FiLM
+        global_feat = global_context  # Reuse the same global context
 
         gamma = self.gamma_mlp(global_feat)  # [B,1,D]
         beta = self.beta_mlp(global_feat)  # [B,1,D]
@@ -212,91 +219,83 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerTraceEncoder(nn.Module):
-    """Encode trace sequences with Transformer"""
+    """Encode traces with coordinate normalization and a Transformer encoder."""
 
-    def __init__(self, d_model: int = 128, nhead: int = 4,
-                 num_layers: int = 3, dim_feedforward: int = 512):
+    def __init__(self, input_dim: int = 11, d_model: int = 128,
+                 nhead: int = 4, num_layers: int = 3):
         super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
 
-        self.input_proj = nn.Linear(11, d_model)
-        self.pos_encoding = PositionalEncoding(d_model)
-        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=dim_feedforward,
+            dim_feedforward=d_model * 4,
             dropout=0.1,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
         Args:
-            traces: [B, N, 11] with (x,y,z,t, vx,vy,vz, ax,ay,az, speed)
-            mask:   [B, N] boolean; True means valid token
+            traces: [B, N, 11] => (x,y,z,t, vx,vy,vz, ax,ay,az, speed)
+            mask:   [B, N] boolean; True for valid positions
+
         Returns:
-            encoded: [B, N, D] transformer features
-            coords:  [B, N, 3] raw (x,y,z) coordinates (not encoded)
+            memory: [B, N, D]
+            coords: [B, N, 3]
+            mean:   [B, 1, 3]
+            scale:  [B, 1, 1]
         """
+        B, N, _ = traces.shape
+        coords = traces[..., :3].contiguous()  # [B,N,3]
 
-        assert traces.size(-1) == 11, \
-            f"TraceEncoder expects last dim=11, got {traces.size(-1)}"
-        if mask is not None:
-            assert mask.dtype == torch.bool, f"mask must be boolean, got {mask.dtype}"
-        # Keep raw coordinates for anchor computation
-        coords = traces[..., :3].contiguous()  # [B,N,3] raw xyz
-        valid = mask if mask is not None else torch.ones(traces.size()[:2], dtype=torch.bool, device=traces.device)
-
-        # mean over valid points
+        valid = mask if mask is not None else torch.ones((B, N), dtype=torch.bool, device=traces.device)
         denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)  # [B,1,1]
-        mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,3]
 
+        mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
         centered = (coords - mean) * valid.unsqueeze(-1)
         rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
-        scale = rms  # scalar per batch (use x,z energy)
+        scale = rms
 
-        x = self.input_proj(traces)  # [B,N,D]
-        x = self.pos_encoding(x)
-        attn_mask = ~mask if mask is not None else None
-        encoded = self.transformer(x, src_key_padding_mask=attn_mask)
+        x = self.input_proj(traces)
+        x = self.pos_encoder(x)
 
-        return encoded, coords, mean, scale
+        pad_mask = ~valid if valid is not None else None
+        memory = self.transformer(x, src_key_padding_mask=pad_mask)
+
+        return memory, coords, mean, scale
 
 
 class ColliderDecoder(nn.Module):
     """
-    Decode colliders using learnable queries (DETR-style), predicting boxes
-    relative to attention-weighted anchors on the input trace coordinates.
+    DETR-style decoder with cross-attention to memory.
     """
 
-    def __init__(self, d_model: int = 128, nhead: int = 4,
-                 num_layers: int = 3, num_queries: int = 30):
+    def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 3, num_queries: int = 30):
         super().__init__()
-
         self.num_queries = num_queries
 
-        # Learnable object queries
+        # Learnable query embeddings (base patterns)
         self.query_embed = nn.Embedding(num_queries, d_model)
 
-        # Transformer decoder
+        # Transformer decoder layers for cross-attention
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=512,
+            dim_feedforward=d_model * 4,
             dropout=0.1,
             batch_first=True
         )
-        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers)
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # Heads:
-        # - delta for center offset relative to the anchor
-        # - size logit will be passed through softplus to ensure positive sizes
-        self.center_delta_head = MLP(d_model, d_model, 3, 2)  # Δcx, Δcy, Δcz
-        self.size_head = MLP(d_model, d_model, 3, 2)  # raw logits -> softplus
-        self.class_head = nn.Linear(d_model, 3)  # BLOCK/LOW/MID
+        # Prediction heads
+        self.center_delta_head = MLP(d_model, d_model, 3, 2)
+        self.size_head = MLP(d_model, d_model, 3, 2)
+        self.class_head = nn.Linear(d_model, 3)
 
-        # Lightweight attention projections for anchor computation
+        # For computing anchor positions
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.scale = d_model ** 0.5  # for dot-product attention scaling
@@ -316,8 +315,17 @@ class ColliderDecoder(nn.Module):
         """
         B, N, D = memory.shape
 
-        # Prepare queries
-        queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, Q, D]
+        base_queries = self.query_embed.weight.unsqueeze(0)  # [1,Q,D]
+
+        # Compute global context from memory
+        if memory_mask is not None:
+            denom = memory_mask.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
+            global_context = (memory * memory_mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,D]
+        else:
+            global_context = memory.mean(dim=1, keepdim=True)
+
+        # Add trace-specific context to queries
+        queries = base_queries + global_context  # [B,Q,D] via broadcasting
 
         # Key padding mask for transformer: True means to ignore
         mem_pad_mask = ~memory_mask if memory_mask is not None else None
