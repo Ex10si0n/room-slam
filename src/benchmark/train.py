@@ -615,7 +615,7 @@ def main():
         rotation_angles=[0, 90, 180, 270],
         scale_range=(0.8, 1.2),
         translation_range=1.0,
-        collider_dropout_prob=0.2
+        collider_dropout_prob=0.7
     )
 
     val_loader = create_dataloader(
@@ -643,8 +643,8 @@ def main():
         'class_loss': 2.0,
         'l1_loss': 2.0,
         'giou_loss': 2.0,
-        'coverage_loss': 5.0,
-        'avoidance_loss': 5.0
+        'coverage_loss': 3.0,
+        'avoidance_loss': 3.0
     }
     criterion = SetCriterion(weight_dict)
 
