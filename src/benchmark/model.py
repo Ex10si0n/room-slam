@@ -28,10 +28,13 @@ class LSTMTraceEncoder(nn.Module):
         valid = mask if mask is not None else torch.ones((B, N), dtype=torch.bool, device=traces.device)
         denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
 
-        mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
-        centered = (coords - mean) * valid.unsqueeze(-1)
-        rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
-        scale = rms
+        # mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
+        # centered = (coords - mean) * valid.unsqueeze(-1)
+        # rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
+        # scale = rms
+
+        mean = torch.zeros(B, 1, 3, device=traces.device, dtype=traces.dtype)
+        scale = torch.ones(B, 1, 1, device=traces.device, dtype=traces.dtype)
 
         x = self.input_proj(traces)
         memory, _ = self.lstm(x)
@@ -225,10 +228,13 @@ class TransformerTraceEncoder(nn.Module):
         valid = mask if mask is not None else torch.ones((B, N), dtype=torch.bool, device=traces.device)
         denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
 
-        mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
-        centered = (coords - mean) * valid.unsqueeze(-1)
-        rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
-        scale = rms
+        # mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
+        # centered = (coords - mean) * valid.unsqueeze(-1)
+        # rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
+        # scale = rms
+
+        mean = torch.zeros(B, 1, 3, device=traces.device, dtype=traces.dtype)
+        scale = torch.ones(B, 1, 1, device=traces.device, dtype=traces.dtype)
 
         x = self.input_proj(traces)
         x = self.pos_encoder(x)
