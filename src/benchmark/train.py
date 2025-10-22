@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -568,6 +570,24 @@ def validate(model, dataloader, criterion, device):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train Room-SLAM model")
+    parser.add_argument('--stage_name', type=str, default="stage1_detect",
+                        help="Name for this training stage (used for save_dir)")
+    parser.add_argument('--load_checkpoint', type=str, default=None,
+                        help="Path to checkpoint to load for fine-tuning (e.g., ./checkpoints_stage1/best_model.pth)")
+    parser.add_argument('--dropout_prob', type=float, default=0.1,
+                        help="Collider dropout probability")
+    parser.add_argument('--cov_weight', type=float, default=0.5,
+                        help="Weight for coverage_loss")
+    parser.add_argument('--avoid_weight', type=float, default=1.0,
+                        help="Weight for avoidance_loss")
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help="Learning rate")
+    parser.add_argument('--num_epochs', type=int, default=200,
+                        help="Number of epochs to train")
+
+    args = parser.parse_args()
+
     # Setup device
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -580,33 +600,29 @@ def main():
     config = {
         'model_type': 'transformer',
         'batch_size': 20,
-        'num_epochs': 200,
-        'lr': 1e-4,
+        'num_epochs': args.num_epochs,
+        'lr': args.lr,
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,
         'data_dir': '../../dataset/train',
         'val_dir': '../../dataset/val',
-        'save_dir': './checkpoints',
-        'warmup_epochs': 10,
+        'save_dir': f'./checkpoints_{args.stage_name}',
         'val_every': 1,
         'iou_thresh': 0.5
     }
 
     # Create save directory
-    Path(config['save_dir']).mkdir(exist_ok=True)
+    save_path = Path(config['save_dir'])
+    save_path.mkdir(exist_ok=True)
 
     # Save config
-    with open(Path(config['save_dir']) / 'config.json', 'w') as f:
+    with open(save_path / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
     # Create dataloaders
-    print("\n=== Data Augmentation Settings ===")
-    print("Rotation: [0°, 90°, 180°, 270°]")
-    print("Translation: ±1.0 meters")
-    print("Scale: 0.8x to 1.2x")
-    print("Collider Dropout: 20% probability")
-    print("=" * 40 + "\n")
+    print(f"\n=== Training Stage: {args.stage_name} ===")
+    print(f"Collider Dropout: {args.dropout_prob}")
 
     train_loader = create_dataloader(
         config['data_dir'],
@@ -619,7 +635,7 @@ def main():
         rotation_angles=[0, 90, 180, 270],
         scale_range=(0.8, 1.2),
         translation_range=1.0,
-        collider_dropout_prob=0.7
+        collider_dropout_prob=args.dropout_prob
     )
 
     val_loader = create_dataloader(
@@ -647,9 +663,10 @@ def main():
         'class_loss': 2.0,
         'l1_loss': 5.0,
         'giou_loss': 2.0,
-        'coverage_loss': 3.0,
-        'avoidance_loss': 5.0
+        'coverage_loss': args.cov_weight,
+        'avoidance_loss': args.avoid_weight
     }
+    print(f"Using weights: {weight_dict}")
     criterion = SetCriterion(weight_dict)
 
     optimizer = AdamW(
@@ -657,6 +674,15 @@ def main():
         lr=config['lr'],
         weight_decay=config['weight_decay']
     )
+
+    start_epoch = 0
+    if args.load_checkpoint:
+        print(f"\nLoading weights from: {args.load_checkpoint}\n")
+        checkpoint = torch.load(args.load_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # start_epoch = checkpoint['epoch'] + 1
 
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -668,7 +694,7 @@ def main():
     # Training loop
     best_val_loss = float('inf')
 
-    for epoch in range(config['num_epochs']):
+    for epoch in range(start_epoch, config['num_epochs']):
         # Train
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch
@@ -711,7 +737,7 @@ def main():
                     'val_loss': val_loss,
                     'metrics': metrics,
                     'config': config
-                }, Path(config['save_dir']) / 'best_model.pth')
+                }, save_path / 'best_model.pth')
                 print(f"  ✓ Saved BEST model (val_loss={best_val_loss:.4f})")
 
         else:
@@ -725,7 +751,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
-            }, Path(config['save_dir']) / f'checkpoint_epoch_{epoch}.pth')
+            }, save_path / f'checkpoint_epoch_{epoch}.pth')
 
     print("Training completed!")
 
