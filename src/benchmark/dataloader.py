@@ -107,22 +107,6 @@ class TraceColliderDataset(Dataset):
         """
         pairs = []
 
-        # Pattern 1: Standard *_trace.json + *_collider.json pairs
-        trace_files = sorted(self.data_dir.glob("*_trace.json"))
-
-        for trace_file in trace_files:
-            # Find corresponding collider file
-            base_name = trace_file.stem.replace('_trace', '')
-            collider_file = self.data_dir / f"{base_name}_collider.json"
-
-            if collider_file.exists():
-                pairs.append({
-                    'trace': trace_file,
-                    'collider': collider_file
-                })
-            else:
-                print(f"Warning: No collider file for {trace_file}")
-
         # Pattern 2 & 3: agent_data_* / human_data_* with shared colliders.json
         if len(pairs) == 0:
             # Look for shared colliders.json
