@@ -1,0 +1,74 @@
+================================================================================
+GRID SEARCH RESULTS
+================================================================================
+
+[DATASET1]
+--------------------------------------------------------------------------------
+
+Top 5 configurations:
+
+1. mIoU: 0.2124
+   grid_size=0.15, min_block_size=1.5, margin=0.3, max_distance=2.0
+   Precision: 0.6638, Recall: 0.6638, F1: 0.6638, Acc: 0.6638
+
+2. mIoU: 0.2120
+   grid_size=0.2, min_block_size=1.5, margin=0.3, max_distance=2.0
+   Precision: 0.6628, Recall: 0.6628, F1: 0.6628, Acc: 0.6628
+
+3. mIoU: 0.2105
+   grid_size=0.15, min_block_size=1.0, margin=0.3, max_distance=2.0
+   Precision: 0.6575, Recall: 0.6575, F1: 0.6575, Acc: 0.6575
+
+4. mIoU: 0.2104
+   grid_size=0.2, min_block_size=0.8, margin=0.3, max_distance=2.0
+   Precision: 0.6584, Recall: 0.6584, F1: 0.6584, Acc: 0.6584
+
+5. mIoU: 0.2102
+   grid_size=0.05, min_block_size=1.5, margin=0.3, max_distance=2.0
+   Precision: 0.6595, Recall: 0.6595, F1: 0.6595, Acc: 0.6595
+
+[DATASET2]
+--------------------------------------------------------------------------------
+
+Top 5 configurations:
+
+1. mIoU: 0.3147
+   grid_size=0.05, min_block_size=0.5, margin=0.3, max_distance=2.0
+   Precision: 0.7644, Recall: 0.7644, F1: 0.7644, Acc: 0.7644
+
+2. mIoU: 0.3145
+   grid_size=0.05, min_block_size=0.3, margin=0.3, max_distance=2.0
+   Precision: 0.7644, Recall: 0.7644, F1: 0.7644, Acc: 0.7644
+
+3. mIoU: 0.3142
+   grid_size=0.2, min_block_size=0.5, margin=0.3, max_distance=2.0
+   Precision: 0.7633, Recall: 0.7633, F1: 0.7633, Acc: 0.7633
+
+4. mIoU: 0.3142
+   grid_size=0.2, min_block_size=0.8, margin=0.3, max_distance=2.0
+   Precision: 0.7633, Recall: 0.7633, F1: 0.7633, Acc: 0.7633
+
+5. mIoU: 0.3142
+   grid_size=0.2, min_block_size=1.0, margin=0.3, max_distance=2.0
+   Precision: 0.7633, Recall: 0.7633, F1: 0.7633, Acc: 0.7633
+
+================================================================================
+OVERALL BEST (averaged across datasets)
+================================================================================
+
+Top 5 overall configurations:
+
+1. Avg mIoU: 0.2623 (+/- 0.0519)
+   grid_size=0.2, min_block_size=0.8, margin=0.3, max_distance=2.0
+
+2. Avg mIoU: 0.2622 (+/- 0.0503)
+   grid_size=0.2, min_block_size=1.5, margin=0.3, max_distance=2.0
+
+3. Avg mIoU: 0.2621 (+/- 0.0521)
+   grid_size=0.2, min_block_size=1.0, margin=0.3, max_distance=2.0
+
+4. Avg mIoU: 0.2615 (+/- 0.0511)
+   grid_size=0.15, min_block_size=1.0, margin=0.3, max_distance=2.0
+
+5. Avg mIoU: 0.2609 (+/- 0.0485)
+   grid_size=0.15, min_block_size=1.5, margin=0.3, max_distance=2.0
