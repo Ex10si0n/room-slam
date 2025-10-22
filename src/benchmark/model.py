@@ -3,11 +3,10 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
+
 class LSTMTraceEncoder(nn.Module):
     """
     Encode trace sequences with a BiLSTM.
-    Input features are expected to be [x,y,z,t, vx,vy,vz, ax,ay,az, speed] (11-D).
-    We keep the same normalization outputs (coords mean/scale) for relative decoding.
     """
 
     def __init__(self, input_dim: int = 11, d_model: int = 128, num_layers: int = 2, dropout: float = 0.1):
@@ -15,18 +14,18 @@ class LSTMTraceEncoder(nn.Module):
         self.input_proj = nn.Linear(input_dim, d_model)
         self.lstm = nn.LSTM(
             input_size=d_model,
-            hidden_size=d_model // 2,   # BiLSTM -> output dim = d_model
+            hidden_size=d_model // 2,
             num_layers=num_layers,
             dropout=dropout if num_layers > 1 else 0.0,
             batch_first=True,
             bidirectional=True
         )
-        self.out_proj = nn.Linear(d_model, d_model)  # optional stabilization
+        self.out_proj = nn.Linear(d_model, d_model)
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
         Args:
-            traces: [B, N, 11]
+            traces: [B, N, 11] with (x,y,z,t, vx,vy,vz, ax,ay,az, speed)
             mask:   [B, N] boolean; True means valid token
 
         Returns:
@@ -35,19 +34,28 @@ class LSTMTraceEncoder(nn.Module):
             mean:   [B, 1, 3] per-batch mean over valid coords
             scale:  [B, 1, 1] per-batch RMS scale (x,z)
         """
+
+        # Extract shapes and raw coordinates
         B, N, _ = traces.shape
         coords = traces[..., :3].contiguous()
 
+        # Handle masking of invalid / padded timesteps:
         valid = mask if mask is not None else torch.ones((B, N), dtype=torch.bool, device=traces.device)
         denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)  # [B,1,1]
+
+        # Compute per-sequence coordinate statistics for normalization:
         mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom
         centered = (coords - mean) * valid.unsqueeze(-1)
         rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
         scale = rms
 
+        # Project raw 11D features -> d_model
         x = self.input_proj(traces)  # [B,N,D]
-        # LSTM can naturally ignore padded zeros; providing mask is optional
-        memory, _ = self.lstm(x)     # [B,N,D]
+
+        # Run bidirectional LSTM over the sequence
+        memory, _ = self.lstm(x)  # [B,N,D]
+
+        # Apply a final linear projection for dimension alignment.
         memory = self.out_proj(memory)
 
         return memory, coords, mean, scale
@@ -55,9 +63,7 @@ class LSTMTraceEncoder(nn.Module):
 
 class SimpleQueryDecoder(nn.Module):
     """
-    Query-based set decoder without a Transformer.
-    It uses learnable queries and dot-product attention over the memory to
-    get both anchor positions (via coords) and query features (via memory values).
+    Query-based set decoder without a Transformer, BiLSTM in this case.
     """
 
     def __init__(self, d_model: int = 128, num_queries: int = 30):
@@ -71,28 +77,39 @@ class SimpleQueryDecoder(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.scale = d_model ** 0.5
 
-        # Heads (same as Transformer decoder variant)
+        # Heads
         self.center_delta_head = MLP(d_model, d_model, 3, 2)
         self.size_head = MLP(d_model, d_model, 3, 2)
-        self.class_head = nn.Linear(d_model, 4)
+        self.class_head = nn.Linear(d_model, 3)
 
-        # Optional FiLM from global memory summary to modulate decoded features
+        # FiLM from global memory summary
         self.gamma_mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
-        self.beta_mlp  = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+        self.beta_mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
 
         # Learnable attention temperature
         self.inv_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(
-        self,
-        memory: torch.Tensor,               # [B,N,D]
-        coords: torch.Tensor,               # [B,N,3]
-        mean: torch.Tensor,                 # [B,1,3]
-        scale: torch.Tensor,                # [B,1,1]
-        memory_mask: Optional[torch.Tensor] = None  # [B,N] True for valid
+            self,
+            memory: torch.Tensor,  # [B,N,D]
+            coords: torch.Tensor,  # [B,N,3]
+            mean: torch.Tensor,  # [B,1,3]
+            scale: torch.Tensor,  # [B,1,1]
+            memory_mask: Optional[torch.Tensor] = None  # [B,N] True for valid
     ):
+        """
+        Args:
+            memory: [B, N, D] encoded features
+            coords: [B, N, 3] raw (x,y,z) of traces
+            mean:   [B, 1, 3] mean of valid coords
+            scale:  [B, 1, 1] scale of
+            memory_mask: [B, N] True for valid
+        Returns:
+            boxes:   [B, Q, 6] absolute boxes (cx,cy,cz,sx,sy,sz)
+            classes: [B, Q, 3] class logits
+        """
         B, N, D = memory.shape
-        queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)   # [B,Q,D]
+        queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B,Q,D]
 
         # Global summary for FiLM
         if memory_mask is not None:
@@ -101,45 +118,45 @@ class SimpleQueryDecoder(nn.Module):
         else:
             global_feat = memory.mean(dim=1, keepdim=True)
 
-        gamma = self.gamma_mlp(global_feat)   # [B,1,D]
-        beta  = self.beta_mlp(global_feat)    # [B,1,D]
+        gamma = self.gamma_mlp(global_feat)  # [B,1,D]
+        beta = self.beta_mlp(global_feat)  # [B,1,D]
 
         # Attention over memory to get query-aligned features
-        q = self.q_proj(queries)                      # [B,Q,D]
-        k = self.k_proj(memory)                       # [B,N,D]
-        v = self.v_proj(memory)                       # [B,N,D]
+        q = self.q_proj(queries)  # [B,Q,D]
+        k = self.k_proj(memory)  # [B,N,D]
+        v = self.v_proj(memory)  # [B,N,D]
         scores = torch.einsum('bqd,bnd->bqn', q, k) * self.inv_temp / self.scale  # [B,Q,N]
 
         if memory_mask is not None:
             pad = ~memory_mask  # True where padded
             scores = scores.masked_fill(pad.unsqueeze(1), float('-inf'))
 
-        attn = torch.softmax(scores, dim=-1)          # [B,Q,N]
-        qfeat = torch.einsum('bqn,bnd->bqd', attn, v) # [B,Q,D]
+        attn = torch.softmax(scores, dim=-1)  # [B,Q,N]
+        qfeat = torch.einsum('bqn,bnd->bqd', attn, v)  # [B,Q,D]
 
         # Apply FiLM modulation
-        decoded = qfeat * (1.0 + gamma) + beta        # [B,Q,D]
+        decoded = qfeat * (1.0 + gamma) + beta  # [B,Q,D]
 
         # Anchor from normalized coords
-        norm_coords = (coords - mean) / scale         # [B,N,3]
+        norm_coords = (coords - mean) / scale  # [B,N,3]
         anchor_pos = torch.einsum('bqn,bnd->bqd', attn, norm_coords)  # [B,Q,3]
 
-        delta_center = self.center_delta_head(decoded)     # [B,Q,3]
-        size_raw     = self.size_head(decoded)             # [B,Q,3]
-        size_norm    = torch.nn.functional.softplus(size_raw) + 1e-4
+        delta_center = self.center_delta_head(decoded)  # [B,Q,3]
+        size_raw = self.size_head(decoded)  # [B,Q,3]
+        size_norm = torch.nn.functional.softplus(size_raw) + 1e-4
 
         center = (anchor_pos + delta_center) * scale + mean
-        size   = size_norm * scale
+        size = size_norm * scale
 
-        boxes   = torch.cat([center, size], dim=-1)        # [B,Q,6]
-        classes = self.class_head(decoded)                  # [B,Q,4]
+        boxes = torch.cat([center, size], dim=-1)  # [B,Q,6]
+        classes = self.class_head(decoded)  # [B,Q,3]
         return boxes, classes
 
 
 class TraceToColliderLSTM(nn.Module):
     """
     LSTM encoder + simple query decoder.
-    Produces {'pred_boxes': [B,Q,6], 'pred_classes': [B,Q,4]}.
+    Produces {'pred_boxes': [B,Q,6], 'pred_classes': [B,Q,3]}.
     """
 
     def __init__(self, d_model: int = 128, num_queries: int = 30, lstm_layers: int = 2, dropout: float = 0.1):
@@ -194,7 +211,7 @@ class PositionalEncoding(nn.Module):
         self.max_len = new_len
 
 
-class TraceEncoder(nn.Module):
+class TransformerTraceEncoder(nn.Module):
     """Encode trace sequences with Transformer"""
 
     def __init__(self, d_model: int = 128, nhead: int = 4,
@@ -202,10 +219,7 @@ class TraceEncoder(nn.Module):
         super().__init__()
 
         self.input_proj = nn.Linear(11, d_model)
-
-        # Positional encoding
         self.pos_encoding = PositionalEncoding(d_model)
-
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -219,13 +233,17 @@ class TraceEncoder(nn.Module):
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
         Args:
-            traces: [B, N, 4] with (x,y,z,t)
+            traces: [B, N, 11] with (x,y,z,t, vx,vy,vz, ax,ay,az, speed)
             mask:   [B, N] boolean; True means valid token
-
         Returns:
             encoded: [B, N, D] transformer features
             coords:  [B, N, 3] raw (x,y,z) coordinates (not encoded)
         """
+
+        assert traces.size(-1) == 11, \
+            f"TraceEncoder expects last dim=11, got {traces.size(-1)}"
+        if mask is not None:
+            assert mask.dtype == torch.bool, f"mask must be boolean, got {mask.dtype}"
         # Keep raw coordinates for anchor computation
         coords = traces[..., :3].contiguous()  # [B,N,3] raw xyz
         valid = mask if mask is not None else torch.ones(traces.size()[:2], dtype=torch.bool, device=traces.device)
@@ -234,7 +252,6 @@ class TraceEncoder(nn.Module):
         denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)  # [B,1,1]
         mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B,1,3]
 
-        # robust scale: RMS of centered coords in x,z (y可选)
         centered = (coords - mean) * valid.unsqueeze(-1)
         rms = torch.sqrt((centered[..., [0, 2]] ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
         scale = rms  # scalar per batch (use x,z energy)
@@ -277,7 +294,7 @@ class ColliderDecoder(nn.Module):
         # - size logit will be passed through softplus to ensure positive sizes
         self.center_delta_head = MLP(d_model, d_model, 3, 2)  # Δcx, Δcy, Δcz
         self.size_head = MLP(d_model, d_model, 3, 2)  # raw logits -> softplus
-        self.class_head = nn.Linear(d_model, 4)  # BLOCK/LOW/MID/HIGH
+        self.class_head = nn.Linear(d_model, 3)  # BLOCK/LOW/MID
 
         # Lightweight attention projections for anchor computation
         self.q_proj = nn.Linear(d_model, d_model)
@@ -295,7 +312,7 @@ class ColliderDecoder(nn.Module):
         """
         Returns:
             boxes:   [B, Q, 6] absolute boxes (cx,cy,cz,sx,sy,sz)
-            classes: [B, Q, 4] class logits
+            classes: [B, Q, 3] class logits
         """
         B, N, D = memory.shape
 
@@ -312,7 +329,6 @@ class ColliderDecoder(nn.Module):
             memory_key_padding_mask=mem_pad_mask
         )  # [B, Q, D]
 
-        # ---------- Anchor attention over raw coordinates ----------
         # Compute attention weights from decoded queries to memory tokens.
         # We do a simple dot-product attention with separate projections.
         q = self.q_proj(decoded)  # [B, Q, D]
@@ -370,14 +386,14 @@ class MLP(nn.Module):
 
 
 class TraceToColliderTransformer(nn.Module):
-    """Complete model: Trace -> Colliders (relative centers to anchors)"""
+    """Trace -> relative Colliders"""
 
     def __init__(self, d_model: int = 128, nhead: int = 4,
                  num_encoder_layers: int = 3, num_decoder_layers: int = 3,
                  num_queries: int = 30):
         super().__init__()
 
-        self.encoder = TraceEncoder(
+        self.encoder = TransformerTraceEncoder(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_encoder_layers
@@ -399,20 +415,20 @@ class TraceToColliderTransformer(nn.Module):
 
         return {
             'pred_boxes': boxes,  # [B, Q, 6] absolute boxes
-            'pred_classes': classes  # [B, Q, 4] class logits
+            'pred_classes': classes  # [B, Q, 3] class logits
         }
 
 
 def build_model(
-    num_queries: int = 80,
-    d_model: int = 256,
-    model_type: str = "transformer",   # 'transformer' or 'lstm'
-    nhead: int = 8,
-    enc_layers: int = 6,
-    dec_layers: int = 6,
-    dim_feedforward: int = 2048,
-    dropout: float = 0.1,
-    lstm_layers: int = 2
+        num_queries: int = 80,
+        d_model: int = 256,
+        model_type: str = "transformer",  # 'transformer' or 'lstm'
+        nhead: int = 8,
+        enc_layers: int = 6,
+        dec_layers: int = 6,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        lstm_layers: int = 2
 ):
     """
     Build model by type. Both variants output the same dict interface.
@@ -426,7 +442,8 @@ def build_model(
             num_decoder_layers=dec_layers,
             num_queries=num_queries
         )
-        print(f"[build_model] Using Transformer: d_model={d_model}, heads={nhead}, enc/dec={enc_layers}/{dec_layers}, queries={num_queries}")
+        print(
+            f"[build_model] Using Transformer: d_model={d_model}, heads={nhead}, enc/dec={enc_layers}/{dec_layers}, queries={num_queries}")
         return model
 
     elif model_type == "lstm":
@@ -453,6 +470,9 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
+    # elif torch.mps.is_available():
+    #     device = torch.device("mps")
+    #     print(f"Using device: {device} (Metal)")
     else:
         device = torch.device("cpu")
         print("CUDA not available, using CPU")
@@ -470,8 +490,9 @@ if __name__ == "__main__":
     print("\nTesting forward pass...")
     batch_size = 2
     seq_len = 1000
-    traces = torch.randn(batch_size, seq_len, 4).to(device)
-    mask = torch.ones(batch_size, seq_len, dtype=torch.bool).to(device)
+    feat_dim = 11
+    traces = torch.randn(batch_size, seq_len, feat_dim, device=device)
+    mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
 
     output = model(traces, mask)
 
@@ -489,4 +510,4 @@ if __name__ == "__main__":
         print(f"\nGPU Memory allocated: {torch.cuda.memory_allocated(device) / 1024 / 1024:.2f} MB")
         print(f"GPU Memory reserved: {torch.cuda.memory_reserved(device) / 1024 / 1024:.2f} MB")
 
-    print("\n✓ Model test passed!")
+    print("\nModel test passed!")

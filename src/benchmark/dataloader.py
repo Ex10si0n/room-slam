@@ -68,7 +68,6 @@ class TraceColliderDataset(Dataset):
             'BLOCK': 0,
             'LOW': 1,
             'MID': 2,
-            'HIGH': 3
         }
         self.id_to_label = {v: k for k, v in self.label_to_id.items()}
 

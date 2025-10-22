@@ -1,6 +1,5 @@
 import torch
 import json
-from pathlib import Path
 import argparse
 from model import build_model
 
@@ -130,9 +129,9 @@ def nms_3d(boxes, scores, iou_threshold=0.5):
 def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_threshold=0.3):
     """Filter and format predictions with NMS"""
     # boxes: [Q, 6] (cx, cy, cz, sx, sy, sz)
-    # classes: [Q, 4] (logits)
+    # classes: [Q, 3] (logits)
 
-    label_map = {0: 'BLOCK', 1: 'LOW', 2: 'MID', 3: 'HIGH'}
+    label_map = {0: 'BLOCK', 1: 'LOW', 2: 'MID'}
 
     # Get class probabilities
     probs = torch.softmax(classes, dim=-1)
@@ -152,7 +151,7 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
 
     # Apply NMS per class
     final_indices = []
-    for label_id in range(4):
+    for label_id in range(3):
         class_mask = valid_labels == label_id
         class_indices = class_mask.nonzero(as_tuple=False).squeeze(-1)
 
@@ -239,7 +238,6 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
     trace_tensor = trace_tensor.unsqueeze(0).to(device)  # [1, N, F]
     mask = mask.unsqueeze(0).to(device)                  # [1, N]
 
-    # --- Auto-adapt feature dim to encoder.input_proj.in_features (no modules() walk) ---
     in_feat = None
     enc = getattr(model, 'encoder', None)
     if enc is not None:
@@ -257,14 +255,12 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
                               device=trace_tensor.device, dtype=trace_tensor.dtype)
             trace_tensor = torch.cat([trace_tensor, pad], dim=-1)
 
-    # --- Forward (new API takes mask; fallback to legacy) ---
     with torch.no_grad():
         try:
             outputs = model(trace_tensor, mask)
         except TypeError:
             outputs = model(trace_tensor)
 
-    # --- Post-process with NMS ---
     pred_boxes = outputs['pred_boxes'][0]      # [Q, 6]
     pred_classes = outputs['pred_classes'][0]  # [Q, 4]
     predictions = post_process_predictions(

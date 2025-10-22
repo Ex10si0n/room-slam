@@ -22,7 +22,7 @@ class HungarianMatcher:
     def forward(self, pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask):
         """
         pred_boxes: [B, Q, 6]
-        pred_classes: [B, Q, 4]
+        pred_classes: [B, Q, 3]
         gt_boxes: [B, M, 6]
         gt_labels: [B, M]
         gt_valid_mask: [B, M] - True for valid colliders
@@ -41,7 +41,7 @@ class HungarianMatcher:
                 continue
 
             # Classification cost
-            prob = pred_classes[b].softmax(-1)  # [Q, 4]
+            prob = pred_classes[b].softmax(-1)  # [Q, 3]
             cost_class = -prob[:, gt_labels[b, valid_mask]]  # [Q, num_valid]
 
             # Box L1 cost
@@ -231,6 +231,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
 
     return total_loss / len(dataloader)
 
+
 @torch.no_grad()
 def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
     model.eval()
@@ -252,11 +253,11 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
         gt_labels = batch['labels'].to(device)
         gt_valid_mask = batch['valid_mask'].to(device)
 
-        outputs = model(traces, mask)  # expects {'pred_boxes':[B,Q,6], 'pred_classes':[B,Q,4]}
+        outputs = model(traces, mask)  # expects {'pred_boxes':[B,Q,6], 'pred_classes':[B,Q,3]}
         pred_boxes = outputs['pred_boxes']
-        pred_logits = outputs['pred_classes']  # [B,Q,4]
+        pred_logits = outputs['pred_classes']  # [B,Q,3]
         pred_probs = pred_logits.softmax(-1)
-        pred_labels = pred_probs.argmax(-1)    # [B,Q]
+        pred_labels = pred_probs.argmax(-1)  # [B,Q]
 
         # Hungarian matching for alignment
         indices = matcher.forward(pred_boxes, pred_logits, gt_boxes, gt_labels, gt_valid_mask)
@@ -274,14 +275,12 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
                 continue
 
             # Matched preds and gts
-            pb = pred_boxes[b, p_idx]                # [K,6]
-            gb = gt_boxes[b, valid_mask][g_idx]      # [K,6]
-            pi = pred_labels[b, p_idx]               # [K]
-            gi = gt_labels[b, valid_mask][g_idx]     # [K]
+            pb = pred_boxes[b, p_idx]  # [K,6]
+            gb = gt_boxes[b, valid_mask][g_idx]  # [K,6]
+            pi = pred_labels[b, p_idx]  # [K]
+            gi = gt_labels[b, valid_mask][g_idx]  # [K]
 
             # IoU / TP/FP
-            # (reuse your SetCriterion box_iou_3d quickly)
-            # quick inline IoU (axis-aligned 3D)
             pb_min = pb[:, :3] - pb[:, 3:] / 2
             pb_max = pb[:, :3] + pb[:, 3:] / 2
             gb_min = gb[:, :3] - gb[:, 3:] / 2
@@ -310,8 +309,6 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
             tp += tp_k
             fp += fp_k
 
-            # (We already added FN above for unmatched gts)
-
     miou = (total_iou_sum / total_iou_cnt) if total_iou_cnt > 0 else 0.0
     precision = tp / (tp + fp + 1e-8)
     recall = tp / (tp + fn + 1e-8)
@@ -326,6 +323,7 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
         'cls_acc': cls_acc,
         'tp': tp, 'fp': fp, 'fn': fn
     }
+
 
 def validate(model, dataloader, criterion, device):
     model.eval()
@@ -358,13 +356,16 @@ def main():
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
+    # elif torch.mps.is_available():
+    #     device = torch.device("mps")
+    #     print(f"Using device: {device} (Metal)")
     else:
         device = torch.device("cpu")
         print(f"CUDA not available, using CPU")
 
-    # Hyperparameters (optimized for training)
+    # Hyperparameters
     config = {
-        'model_type': 'lstm',
+        'model_type': 'transformer',
         'batch_size': 20,
         'num_epochs': 200,
         'lr': 2e-4,
@@ -386,7 +387,7 @@ def main():
     with open(Path(config['save_dir']) / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
-    # Create dataloaders with AGGRESSIVE augmentation
+    # Create dataloaders with augmentation
     print("\n=== Data Augmentation Settings ===")
     print("Rotation: [0°, 90°, 180°, 270°]")
     print("Translation: ±1.0 meters")
@@ -431,9 +432,9 @@ def main():
 
     # Loss and optimizer
     weight_dict = {
-        'class_loss': 2.0,  # Increased class loss weight
-        'l1_loss': 5.0,  # L1 box loss
-        'giou_loss': 2.0  # GIoU loss for better localization
+        'class_loss': 2.0,
+        'l1_loss': 5.0,
+        'giou_loss': 2.0
     }
     criterion = SetCriterion(weight_dict)
 
@@ -461,12 +462,12 @@ def main():
     best_val_loss = float('inf')
 
     for epoch in range(config['num_epochs']):
-        # === Train ===
+        # Train
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch
         )
 
-        # === Validate ===
+        # Validate
         if (epoch + 1) % config['val_every'] == 0:
             val_loss = validate(model, val_loader, criterion, device)
             metrics = evaluate_metrics(model, val_loader, device, iou_thresh=config['iou_thresh'])
@@ -505,6 +506,7 @@ def main():
             }, Path(config['save_dir']) / f'checkpoint_epoch_{epoch}.pth')
 
     print("Training completed!")
+
 
 if __name__ == "__main__":
     main()
