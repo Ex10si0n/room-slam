@@ -106,7 +106,6 @@ InitTestScene*.unity*
 .idea/
 *.iml
 *.iws
-out/
 
 
 # VS Code
@@ -124,4 +123,4 @@ out/
 /collector/Assets/Tutorials/Media/
 
 
-/visualization/img
+/visualization/
