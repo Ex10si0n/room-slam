@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from scipy.optimize import linear_sum_assignment
 import numpy as np
@@ -61,8 +62,126 @@ class HungarianMatcher:
         return indices
 
 
+class TraceColliderAlignmentLoss(nn.Module):
+
+    def __init__(
+            self,
+            coverage_weight: float = 1.0,
+            avoidance_weight: float = 2.0,
+    ):
+        super().__init__()
+        self.coverage_weight = coverage_weight
+        self.avoidance_weight = avoidance_weight
+
+    def forward(
+            self,
+            pred_boxes: torch.Tensor,  # [B, Q, 6]
+            pred_classes: torch.Tensor,  # [B, Q, 3] logits
+            traces: torch.Tensor,  # [B, N, 11]
+            trace_mask: torch.Tensor,  # [B, N]
+    ) -> dict:
+        """Compute alignment losses"""
+        losses = {}
+
+        # Coverage Loss
+        coverage_loss = self.compute_coverage_loss(
+            pred_boxes, pred_classes, traces, trace_mask
+        )
+        losses['coverage'] = coverage_loss * self.coverage_weight
+
+        # Avoidance Loss
+        avoidance_loss = self.compute_avoidance_loss(
+            pred_boxes, pred_classes, traces, trace_mask
+        )
+        losses['avoidance'] = avoidance_loss * self.avoidance_weight
+
+        return losses
+
+    def compute_coverage_loss(
+            self,
+            pred_boxes: torch.Tensor,
+            pred_classes: torch.Tensor,
+            traces: torch.Tensor,
+            trace_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Converage loss, encourages trace points to be close to passable colliders (LOW/MID)
+        """
+        B, Q, _ = pred_boxes.shape
+        B, N, _ = traces.shape
+
+        trace_coords = traces[..., :3]  # [B, N, 3]
+        box_centers = pred_boxes[..., :3]  # [B, Q, 3]
+        box_sizes = pred_boxes[..., 3:]  # [B, Q, 3]
+
+        # Get class probabilities
+        class_probs = F.softmax(pred_classes, dim=-1)  # [B, Q, 3]
+
+        # Only consider non-BLOCK boxes (LOW/MID are passable)
+        # class 0=BLOCK, 1=LOW, 2=MID
+        passable_probs = class_probs[..., 1:].sum(dim=-1)  # [B, Q]
+
+        # Compute distance from each trace point to each box
+        # [B, N, Q, 3]
+        diffs = trace_coords.unsqueeze(2) - box_centers.unsqueeze(1)
+        dists = diffs.abs()  # L1 distance per dimension
+
+        # Check if point is inside box (using soft margin)
+        half_sizes = box_sizes.unsqueeze(1) / 2  # [B, 1, Q, 3]
+        inside_margin = F.relu(dists - half_sizes)  # [B, N, Q, 3]
+        point_to_box_dist = inside_margin.sum(dim=-1)  # [B, N, Q]
+
+        # Weight by passability
+        weighted_dist = point_to_box_dist * passable_probs.unsqueeze(1)  # [B, N, Q]
+
+        # For each trace point, find minimum weighted distance
+        min_dist, _ = weighted_dist.min(dim=-1)  # [B, N]
+
+        # Apply mask and normalize
+        valid_dists = min_dist * trace_mask
+        coverage_loss = valid_dists.sum() / (trace_mask.sum() + 1e-6)
+
+        return coverage_loss
+
+    def compute_avoidance_loss(
+            self,
+            pred_boxes: torch.Tensor,
+            pred_classes: torch.Tensor,
+            traces: torch.Tensor,
+            trace_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Avoidance Loss penalizes trace points inside BLOCK colliders"""
+        B, Q, _ = pred_boxes.shape
+        B, N, _ = traces.shape
+
+        trace_coords = traces[..., :3]  # [B, N, 3]
+        box_centers = pred_boxes[..., :3]  # [B, Q, 3]
+        box_sizes = pred_boxes[..., 3:]  # [B, Q, 3]
+
+        # Get BLOCK probabilities (class 0)
+        class_probs = F.softmax(pred_classes, dim=-1)  # [B, Q, 3]
+        block_probs = class_probs[..., 0]  # [B, Q]
+
+        # Compute if trace points are inside boxes
+        diffs = (trace_coords.unsqueeze(2) - box_centers.unsqueeze(1)).abs()  # [B, N, Q, 3]
+        half_sizes = box_sizes.unsqueeze(1) / 2  # [B, 1, Q, 3]
+        inside = (diffs < half_sizes).all(dim=-1).float()  # [B, N, Q]
+
+        # Penalize being inside BLOCK boxes
+        penetration = inside * block_probs.unsqueeze(1)  # [B, N, Q]
+
+        # Sum over boxes and points
+        total_penetration = penetration.sum(dim=-1)  # [B, N]
+
+        # Apply mask and normalize
+        valid_penetration = total_penetration * trace_mask
+        avoidance_loss = valid_penetration.sum() / (trace_mask.sum() + 1e-6)
+
+        return avoidance_loss
+
+
 class SetCriterion(nn.Module):
-    """Loss computation with GIoU"""
+    """Loss computation with GIoU + Alignment"""
 
     def __init__(self, weight_dict):
         super().__init__()
@@ -71,6 +190,12 @@ class SetCriterion(nn.Module):
 
         self.class_loss = nn.CrossEntropyLoss()
         self.l1_loss = nn.L1Loss(reduction='none')
+
+        # 🔑 NEW: Alignment loss
+        self.alignment_loss = TraceColliderAlignmentLoss(
+            coverage_weight=1.0,
+            avoidance_weight=2.0
+        )
 
     def box_iou_3d(self, boxes1, boxes2):
         """Compute 3D IoU between boxes"""
@@ -106,12 +231,12 @@ class SetCriterion(nn.Module):
 
         return iou, giou
 
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, traces, trace_mask):
         pred_boxes = outputs['pred_boxes']
         pred_classes = outputs['pred_classes']
         gt_boxes = targets['boxes']
         gt_labels = targets['labels']
-        gt_valid_mask = targets['valid_mask']  # Use valid_mask from dataloader
+        gt_valid_mask = targets['valid_mask']
 
         # Hungarian matching
         indices = self.matcher.forward(pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask)
@@ -127,6 +252,11 @@ class SetCriterion(nn.Module):
         l1_loss, giou_loss = self._compute_box_loss(pred_boxes, gt_boxes, gt_valid_mask, indices)
         losses['l1_loss'] = l1_loss
         losses['giou_loss'] = giou_loss
+
+        # Alignment losses
+        alignment_losses = self.alignment_loss(pred_boxes, pred_classes, traces, trace_mask)
+        losses['coverage_loss'] = alignment_losses['coverage']
+        losses['avoidance_loss'] = alignment_losses['avoidance']
 
         # Total loss
         total_loss = sum(losses[k] * self.weight_dict.get(k, 1.0) for k in losses.keys())
@@ -199,7 +329,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         mask = batch['trace_mask'].to(device)
         boxes = batch['boxes'].to(device)
         labels = batch['labels'].to(device)
-        valid_mask = batch['valid_mask'].to(device)  # Add valid_mask
+        valid_mask = batch['valid_mask'].to(device)
 
         # Forward
         outputs = model(traces, mask)
@@ -208,9 +338,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         targets = {
             'boxes': boxes,
             'labels': labels,
-            'valid_mask': valid_mask  # Pass valid_mask to criterion
+            'valid_mask': valid_mask
         }
-        losses = criterion(outputs, targets)
+        losses = criterion(outputs, targets, traces, mask)
 
         loss = losses['total_loss']
 
@@ -226,7 +356,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
             'loss': f"{loss.item():.4f}",
             'cls': f"{losses['class_loss'].item():.4f}",
             'l1': f"{losses['l1_loss'].item():.4f}",
-            'giou': f"{losses['giou_loss'].item():.4f}"
+            'giou': f"{losses['giou_loss'].item():.4f}",
+            'cov': f"{losses['coverage_loss'].item():.4f}",
+            'avoid': f"{losses['avoidance_loss'].item():.4f}"
         })
 
     return total_loss / len(dataloader)
@@ -253,14 +385,12 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
         gt_labels = batch['labels'].to(device)
         gt_valid_mask = batch['valid_mask'].to(device)
 
-        outputs = model(traces, mask)  # expects {'pred_boxes':[B,Q,6], 'pred_classes':[B,Q,3]}
+        outputs = model(traces, mask)
         pred_boxes = outputs['pred_boxes']
-        pred_logits = outputs['pred_classes']  # [B,Q,3]
-        pred_probs = pred_logits.softmax(-1)
-        pred_labels = pred_probs.argmax(-1)  # [B,Q]
+        pred_classes = outputs['pred_classes']
+        pred_labels = pred_classes.argmax(dim=-1)
 
-        # Hungarian matching for alignment
-        indices = matcher.forward(pred_boxes, pred_logits, gt_boxes, gt_labels, gt_valid_mask)
+        indices = matcher.forward(pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask)
 
         # Accumulate metrics per batch
         B, Q = pred_boxes.shape[:2]
@@ -268,17 +398,17 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
             valid_mask = gt_valid_mask[b]
             num_valid = int(valid_mask.sum().item())
 
-            # Count FN as ground-truth that got no match (if Hungarian returns < num_valid)
+            # Count FN
             fn += max(0, num_valid - len(g_idx))
 
             if len(p_idx) == 0:
                 continue
 
             # Matched preds and gts
-            pb = pred_boxes[b, p_idx]  # [K,6]
-            gb = gt_boxes[b, valid_mask][g_idx]  # [K,6]
-            pi = pred_labels[b, p_idx]  # [K]
-            gi = gt_labels[b, valid_mask][g_idx]  # [K]
+            pb = pred_boxes[b, p_idx]
+            gb = gt_boxes[b, valid_mask][g_idx]
+            pi = pred_labels[b, p_idx]
+            gi = gt_labels[b, valid_mask][g_idx]
 
             # IoU / TP/FP
             pb_min = pb[:, :3] - pb[:, 3:] / 2
@@ -299,11 +429,11 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
             total_iou_sum += ious.sum().item()
             total_iou_cnt += ious.numel()
 
-            # Classification accuracy over matched pairs
+            # Classification accuracy
             cls_correct += (pi == gi).sum().item()
             cls_total += pi.numel()
 
-            # For detection PR: a matched pred counts as TP if IoU>=thr, else FP
+            # TP/FP
             tp_k = (ious >= iou_thresh).sum().item()
             fp_k = (ious < iou_thresh).sum().item()
             tp += tp_k
@@ -336,15 +466,16 @@ def validate(model, dataloader, criterion, device):
             mask = batch['trace_mask'].to(device)
             boxes = batch['boxes'].to(device)
             labels = batch['labels'].to(device)
-            valid_mask = batch['valid_mask'].to(device)  # Add valid_mask
+            valid_mask = batch['valid_mask'].to(device)
 
             outputs = model(traces, mask)
             targets = {
                 'boxes': boxes,
                 'labels': labels,
-                'valid_mask': valid_mask  # Pass valid_mask
+                'valid_mask': valid_mask
             }
-            losses = criterion(outputs, targets)
+            # Pass traces and mask
+            losses = criterion(outputs, targets, traces, mask)
 
             total_loss += losses['total_loss'].item()
 
@@ -352,13 +483,10 @@ def validate(model, dataloader, criterion, device):
 
 
 def main():
-    # Setup device - use CUDA
+    # Setup device
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
-    # elif torch.mps.is_available():
-    #     device = torch.device("mps")
-    #     print(f"Using device: {device} (Metal)")
     else:
         device = torch.device("cpu")
         print(f"CUDA not available, using CPU")
@@ -368,13 +496,13 @@ def main():
         'model_type': 'transformer',
         'batch_size': 20,
         'num_epochs': 200,
-        'lr': 2e-4,
+        'lr': 1e-4,
         'weight_decay': 1e-4,
         'd_model': 128,
         'num_queries': 30,
         'data_dir': '../../dataset/train',
         'val_dir': '../../dataset/val',
-        'save_dir': './checkpoints',
+        'save_dir': './checkpoints_alignment',
         'warmup_epochs': 10,
         'val_every': 1,
         'iou_thresh': 0.5
@@ -387,12 +515,13 @@ def main():
     with open(Path(config['save_dir']) / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
-    # Create dataloaders with augmentation
+    # Create dataloaders
     print("\n=== Data Augmentation Settings ===")
     print("Rotation: [0°, 90°, 180°, 270°]")
     print("Translation: ±1.0 meters")
     print("Scale: 0.8x to 1.2x")
     print("Collider Dropout: 20% probability")
+    print("🔑 NEW: Alignment Loss Enabled")
     print("=" * 40 + "\n")
 
     train_loader = create_dataloader(
@@ -430,11 +559,12 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {num_params:,}")
 
-    # Loss and optimizer
     weight_dict = {
         'class_loss': 2.0,
         'l1_loss': 5.0,
-        'giou_loss': 2.0
+        'giou_loss': 2.0,
+        'coverage_loss': 1.5,
+        'avoidance_loss': 3.0
     }
     criterion = SetCriterion(weight_dict)
 
@@ -444,14 +574,7 @@ def main():
         weight_decay=config['weight_decay']
     )
 
-    # Learning rate scheduler with warmup
-    def lr_lambda(epoch):
-        if epoch < config['warmup_epochs']:
-            return (epoch + 1) / config['warmup_epochs']
-        else:
-            return 0.5 * (1 + np.cos(np.pi * (epoch - config['warmup_epochs']) /
-                                     (config['num_epochs'] - config['warmup_epochs'])))
-
+    # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min', factor=0.5, patience=5,
@@ -479,7 +602,7 @@ def main():
                   f"P={metrics['precision']:.3f} R={metrics['recall']:.3f} F1={metrics['f1']:.3f} "
                   f"ClsAcc={metrics['cls_acc']:.3f} | LR={optimizer.param_groups[0]['lr']:.6f}")
 
-            # Save best on validation loss
+            # Save best
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save({
@@ -494,7 +617,7 @@ def main():
 
         else:
             print(f"Epoch {epoch}: Train {train_loss:.4f} | "
-                  f"LR={optimizer.param_groups[0]['lr']:.6f} (no val this epoch)")
+                  f"LR={optimizer.param_groups[0]['lr']:.6f}")
 
         # Regular checkpoint
         if (epoch + 1) % 10 == 0:
