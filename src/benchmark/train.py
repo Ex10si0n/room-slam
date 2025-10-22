@@ -63,7 +63,6 @@ class HungarianMatcher:
 
 
 class TraceColliderAlignmentLoss(nn.Module):
-
     def __init__(
             self,
             coverage_weight: float = 1.0,
@@ -104,9 +103,6 @@ class TraceColliderAlignmentLoss(nn.Module):
             traces: torch.Tensor,
             trace_mask: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Converage loss, encourages trace points to be close to passable colliders (LOW/MID)
-        """
         B, Q, _ = pred_boxes.shape
         B, N, _ = traces.shape
 
@@ -150,7 +146,6 @@ class TraceColliderAlignmentLoss(nn.Module):
             traces: torch.Tensor,
             trace_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Avoidance Loss penalizes trace points inside BLOCK colliders"""
         B, Q, _ = pred_boxes.shape
         B, N, _ = traces.shape
 
@@ -191,7 +186,6 @@ class SetCriterion(nn.Module):
         self.class_loss = nn.CrossEntropyLoss()
         self.l1_loss = nn.L1Loss(reduction='none')
 
-        # 🔑 NEW: Alignment loss
         self.alignment_loss = TraceColliderAlignmentLoss(
             coverage_weight=1.0,
             avoidance_weight=2.0
@@ -253,7 +247,6 @@ class SetCriterion(nn.Module):
         losses['l1_loss'] = l1_loss
         losses['giou_loss'] = giou_loss
 
-        # Alignment losses
         alignment_losses = self.alignment_loss(pred_boxes, pred_classes, traces, trace_mask)
         losses['coverage_loss'] = alignment_losses['coverage']
         losses['avoidance_loss'] = alignment_losses['avoidance']
@@ -334,7 +327,6 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         # Forward
         outputs = model(traces, mask)
 
-        # Compute loss
         targets = {
             'boxes': boxes,
             'labels': labels,
@@ -364,19 +356,56 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
     return total_loss / len(dataloader)
 
 
+def compute_iou_matrix_3d(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Compute pairwise 3D IoU between two sets of boxes"""
+    N = boxes1.shape[0]
+    M = boxes2.shape[0]
+
+    boxes1_min = boxes1[:, :3] - boxes1[:, 3:] / 2
+    boxes1_max = boxes1[:, :3] + boxes1[:, 3:] / 2
+    boxes2_min = boxes2[:, :3] - boxes2[:, 3:] / 2
+    boxes2_max = boxes2[:, :3] + boxes2[:, 3:] / 2
+
+    boxes1_min = boxes1_min.unsqueeze(1)
+    boxes1_max = boxes1_max.unsqueeze(1)
+    boxes2_min = boxes2_min.unsqueeze(0)
+    boxes2_max = boxes2_max.unsqueeze(0)
+
+    inter_min = torch.maximum(boxes1_min, boxes2_min)
+    inter_max = torch.minimum(boxes1_max, boxes2_max)
+    inter_size = torch.clamp(inter_max - inter_min, min=0)
+    inter_volume = inter_size.prod(dim=2)
+
+    boxes1_volume = boxes1[:, 3:].prod(dim=1, keepdim=True)
+    boxes2_volume = boxes2[:, 3:].prod(dim=1, keepdim=True)
+    union_volume = boxes1_volume + boxes2_volume.T - inter_volume
+
+    iou = inter_volume / (union_volume + 1e-6)
+    return iou
+
+
 @torch.no_grad()
 def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
     model.eval()
-    matcher = HungarianMatcher()
+
     total_iou_sum = 0.0
     total_iou_cnt = 0
-
     tp = 0
     fp = 0
     fn = 0
 
     cls_correct = 0
     cls_total = 0
+
+    # Per-class metrics
+    class_names = ['BLOCK', 'LOW', 'MID']
+    per_class_stats = {
+        cls_name: {'correct': 0, 'total': 0, 'tp': 0, 'fp': 0, 'fn': 0}
+        for cls_name in class_names
+    }
+
+    # Confusion matrix
+    confusion = np.zeros((3, 3), dtype=int)
 
     for batch in tqdm(dataloader, desc="Evaluating"):
         traces = batch['traces'].to(device)
@@ -389,55 +418,83 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
         pred_boxes = outputs['pred_boxes']
         pred_classes = outputs['pred_classes']
         pred_labels = pred_classes.argmax(dim=-1)
+        pred_probs = torch.softmax(pred_classes, dim=-1)
+        pred_conf = pred_probs.max(dim=-1)[0]
 
-        indices = matcher.forward(pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask)
-
-        # Accumulate metrics per batch
         B, Q = pred_boxes.shape[:2]
-        for b, (p_idx, g_idx) in enumerate(indices):
+
+        for b in range(B):
             valid_mask = gt_valid_mask[b]
             num_valid = int(valid_mask.sum().item())
 
-            # Count FN
-            fn += max(0, num_valid - len(g_idx))
-
-            if len(p_idx) == 0:
+            if num_valid == 0:
                 continue
 
-            # Matched preds and gts
-            pb = pred_boxes[b, p_idx]
-            gb = gt_boxes[b, valid_mask][g_idx]
-            pi = pred_labels[b, p_idx]
-            gi = gt_labels[b, valid_mask][g_idx]
+            gt_b = gt_boxes[b, valid_mask]
+            gt_l = gt_labels[b, valid_mask]
 
-            # IoU / TP/FP
-            pb_min = pb[:, :3] - pb[:, 3:] / 2
-            pb_max = pb[:, :3] + pb[:, 3:] / 2
-            gb_min = gb[:, :3] - gb[:, 3:] / 2
-            gb_max = gb[:, :3] + gb[:, 3:] / 2
+            # Filter predictions by confidence
+            conf_threshold = 0.1
+            valid_preds = pred_conf[b] > conf_threshold
 
-            inter_min = torch.maximum(pb_min, gb_min)
-            inter_max = torch.minimum(pb_max, gb_max)
-            inter = torch.clamp(inter_max - inter_min, min=0)
-            inter_v = inter.prod(dim=1)
+            pred_b = pred_boxes[b, valid_preds]
+            pred_l = pred_labels[b, valid_preds]
 
-            pv = pb[:, 3:].prod(dim=1)
-            gv = gb[:, 3:].prod(dim=1)
-            union_v = pv + gv - inter_v + 1e-6
-            ious = inter_v / union_v
+            if pred_b.shape[0] == 0:
+                for gt_cls in gt_l:
+                    cls_name = class_names[gt_cls.item()]
+                    per_class_stats[cls_name]['fn'] += 1
+                fn += num_valid
+                continue
 
-            total_iou_sum += ious.sum().item()
-            total_iou_cnt += ious.numel()
+            # Compute IoU matrix
+            iou_matrix = compute_iou_matrix_3d(pred_b, gt_b)
 
-            # Classification accuracy
-            cls_correct += (pi == gi).sum().item()
-            cls_total += pi.numel()
+            # Hungarian matching
+            cost_matrix = -iou_matrix.cpu().numpy()
+            pred_idx, gt_idx = linear_sum_assignment(cost_matrix)
 
-            # TP/FP
-            tp_k = (ious >= iou_thresh).sum().item()
-            fp_k = (ious < iou_thresh).sum().item()
-            tp += tp_k
-            fp += fp_k
+            matched_ious = iou_matrix[pred_idx, gt_idx]
+
+            # Statistics for matched pairs
+            for i, (p_i, g_i) in enumerate(zip(pred_idx, gt_idx)):
+                iou = matched_ious[i].item()
+
+                total_iou_sum += iou
+                total_iou_cnt += 1
+
+                pred_cls = pred_l[p_i].item()
+                gt_cls = gt_l[g_i].item()
+
+                confusion[gt_cls, pred_cls] += 1
+
+                if iou >= iou_thresh:
+                    tp += 1
+                    cls_total += 1
+                    if pred_cls == gt_cls:
+                        cls_correct += 1
+                        cls_name = class_names[gt_cls]
+                        per_class_stats[cls_name]['correct'] += 1
+
+                    per_class_stats[class_names[gt_cls]]['total'] += 1
+                    per_class_stats[class_names[gt_cls]]['tp'] += 1
+                else:
+                    fp += 1
+                    per_class_stats[class_names[pred_cls]]['fp'] += 1
+
+            # Unmatched GT boxes are FN
+            unmatched_gt = set(range(len(gt_l))) - set(gt_idx)
+            for g_i in unmatched_gt:
+                fn += 1
+                cls_name = class_names[gt_l[g_i].item()]
+                per_class_stats[cls_name]['fn'] += 1
+
+            # Unmatched predictions are FP
+            unmatched_pred = set(range(len(pred_l))) - set(pred_idx)
+            for p_i in unmatched_pred:
+                fp += 1
+                cls_name = class_names[pred_l[p_i].item()]
+                per_class_stats[cls_name]['fp'] += 1
 
     miou = (total_iou_sum / total_iou_cnt) if total_iou_cnt > 0 else 0.0
     precision = tp / (tp + fp + 1e-8)
@@ -445,13 +502,38 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
     cls_acc = (cls_correct / cls_total) if cls_total > 0 else 0.0
 
+    # Per-class metrics
+    per_class_metrics = {}
+    for cls_name in class_names:
+        stats = per_class_stats[cls_name]
+        cls_precision = stats['tp'] / (stats['tp'] + stats['fp'] + 1e-8)
+        cls_recall = stats['tp'] / (stats['tp'] + stats['fn'] + 1e-8)
+        cls_f1 = 2 * cls_precision * cls_recall / (cls_precision + cls_recall + 1e-8)
+        cls_accuracy = stats['correct'] / stats['total'] if stats['total'] > 0 else 0.0
+
+        per_class_metrics[cls_name] = {
+            'precision': cls_precision,
+            'recall': cls_recall,
+            'f1': cls_f1,
+            'accuracy': cls_accuracy,
+            'tp': stats['tp'],
+            'fp': stats['fp'],
+            'fn': stats['fn']
+        }
+
     return {
         'mIoU': miou,
         'precision': precision,
         'recall': recall,
         'f1': f1,
         'cls_acc': cls_acc,
-        'tp': tp, 'fp': fp, 'fn': fn
+        'tp': tp,
+        'fp': fp,
+        'fn': fn,
+        'per_class': per_class_metrics,
+        'confusion_matrix': confusion,
+        'cls_correct': cls_correct,
+        'cls_total': cls_total
     }
 
 
@@ -474,7 +556,6 @@ def validate(model, dataloader, criterion, device):
                 'labels': labels,
                 'valid_mask': valid_mask
             }
-            # Pass traces and mask
             losses = criterion(outputs, targets, traces, mask)
 
             total_loss += losses['total_loss'].item()
@@ -521,7 +602,6 @@ def main():
     print("Translation: ±1.0 meters")
     print("Scale: 0.8x to 1.2x")
     print("Collider Dropout: 20% probability")
-    print("🔑 NEW: Alignment Loss Enabled")
     print("=" * 40 + "\n")
 
     train_loader = create_dataloader(
@@ -597,12 +677,27 @@ def main():
 
             scheduler.step(val_loss)
 
-            print(f"Epoch {epoch}: Train {train_loss:.4f} | Val {val_loss:.4f} | "
-                  f"mIoU={metrics['mIoU']:.3f} "
-                  f"P={metrics['precision']:.3f} R={metrics['recall']:.3f} F1={metrics['f1']:.3f} "
-                  f"ClsAcc={metrics['cls_acc']:.3f} | LR={optimizer.param_groups[0]['lr']:.6f}")
+            print(f"\nEpoch {epoch}: Train {train_loss:.4f} | Val {val_loss:.4f}")
+            print(f"  Overall: mIoU={metrics['mIoU']:.4f} P={metrics['precision']:.4f} "
+                  f"R={metrics['recall']:.4f} F1={metrics['f1']:.4f}")
+            print(f"  ClsAcc: {metrics['cls_acc']:.4f} ({metrics['cls_correct']}/{metrics['cls_total']})")
 
-            # Save best
+            # Per-class accuracy
+            print(f"  Per-Class Acc:", end=" ")
+            for cls_name in ['BLOCK', 'LOW', 'MID']:
+                cls_acc = metrics['per_class'][cls_name]['accuracy']
+                print(f"{cls_name}={cls_acc:.4f}", end=" ")
+            print()
+
+            # Confusion matrix (compact)
+            confusion = metrics['confusion_matrix']
+            print(f"  Confusion: [B:{confusion[0, 0]}/{confusion[0].sum()} "
+                  f"L:{confusion[1, 1]}/{confusion[1].sum()} "
+                  f"M:{confusion[2, 2]}/{confusion[2].sum()}]")
+
+            print(f"  LR={optimizer.param_groups[0]['lr']:.6f}")
+
+            # Save best on validation loss
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save({
@@ -613,7 +708,7 @@ def main():
                     'metrics': metrics,
                     'config': config
                 }, Path(config['save_dir']) / 'best_model.pth')
-                print(f"✓ Saved BEST model (val_loss={best_val_loss:.4f})")
+                print(f"  ✓ Saved BEST model (val_loss={best_val_loss:.4f})")
 
         else:
             print(f"Epoch {epoch}: Train {train_loss:.4f} | "
