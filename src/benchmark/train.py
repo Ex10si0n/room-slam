@@ -678,7 +678,7 @@ def main():
     start_epoch = 0
     if args.load_checkpoint:
         print(f"\nLoading weights from: {args.load_checkpoint}\n")
-        checkpoint = torch.load(args.load_checkpoint, map_location=device)
+        checkpoint = torch.load(args.load_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
 
         # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
