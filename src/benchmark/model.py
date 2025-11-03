@@ -325,6 +325,7 @@ class ColliderDecoder(nn.Module):
         spatial_feat = self.spatial_proj(spatial_stats)
         combined_context = global_context + spatial_feat
 
+        # FiLM modulation
         gamma = self.gamma_mlp(combined_context)
         beta = self.beta_mlp(combined_context)
         queries = base_queries * (1.0 + gamma) + beta
@@ -344,6 +345,7 @@ class ColliderDecoder(nn.Module):
             pad = ~memory_mask
             attn_scores = attn_scores.masked_fill(pad.unsqueeze(1), float('-inf'))
 
+        # Anchor computation
         norm_coords = (coords - mean) / scale
         attn_weights = torch.softmax(attn_scores, dim=-1)
         anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, norm_coords)

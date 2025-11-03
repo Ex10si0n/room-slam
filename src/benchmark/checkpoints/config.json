@@ -1,0 +1,15 @@
+{
+  "model_type": "transformer",
+  "batch_size": 20,
+  "num_epochs": 200,
+  "lr": 0.0002,
+  "weight_decay": 0.0001,
+  "d_model": 128,
+  "num_queries": 30,
+  "data_dir": "../../dataset/train",
+  "val_dir": "../../dataset/val",
+  "save_dir": "./checkpoints",
+  "warmup_epochs": 10,
+  "val_every": 1,
+  "iou_thresh": 0.5
+}

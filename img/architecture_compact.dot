@@ -1,0 +1,72 @@
+digraph RoomSLAM_compact {
+    rankdir=LR;
+    node [shape=box, style="rounded,filled", fillcolor=lightblue, fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+    
+    // Input
+    input [label="Trace\nSequence\n[B×N×11]", fillcolor="#e8f5e9", width=1.2];
+    
+    // Encoder options
+    subgraph cluster_encoder {
+        label="Encoder";
+        style="rounded,filled";
+        fillcolor="#e3f2fd";
+        margin=15;
+        
+        enc_opt [label="BiLSTM\nor\nTransformer", shape=box, fillcolor="#bbdefb"];
+    }
+    
+    // Memory
+    memory [label="Memory\n[B×N×D]", fillcolor="#fff9c4"];
+    
+    // Decoder
+    subgraph cluster_decoder {
+        label="Decoder";
+        style="rounded,filled";
+        fillcolor="#fce4ec";
+        margin=15;
+        
+        subgraph cluster_dec_inner {
+            rank=same;
+            queries [label="Learnable\nQueries [Q×D]", fillcolor="#f8bbd0"];
+            context [label="Context\nAggregation", fillcolor="#f8bbd0"];
+            film [label="FiLM\nγ, β", fillcolor="#f8bbd0"];
+        }
+        
+        cross_attn [label="Cross-Attention\nQ × Memory", fillcolor="#f8bbd0"];
+        
+        queries -> film;
+        context -> film;
+        film -> cross_attn;
+    }
+    
+    // Prediction heads
+    subgraph cluster_heads {
+        label="Prediction Heads";
+        style="rounded,filled";
+        fillcolor="#fff3e0";
+        margin=15;
+        
+        heads [label="Center Δ | Size | Class", fillcolor="#ffe0b2"];
+    }
+    
+    // Outputs
+    output [label="3D Boxes\n+ Classes\n[B×Q×9]", fillcolor="#e8f5e9", width=1.2];
+    
+    // Main flow
+    input -> enc_opt;
+    enc_opt -> memory;
+    memory -> context;
+    memory -> cross_attn;
+    cross_attn -> heads;
+    heads -> output;
+    
+    // Style
+    {rank=same; input;}
+    {rank=same; enc_opt;}
+    {rank=same; memory;}
+    {rank=same; queries; context; film;}
+    {rank=same; cross_attn;}
+    {rank=same; heads;}
+    {rank=same; output;}
+}
