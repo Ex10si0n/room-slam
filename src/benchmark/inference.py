@@ -1,6 +1,11 @@
 import torch
 import json
 import argparse
+from pathlib import Path
+import sys
+import tempfile
+sys.path.append(str(Path(__file__).parent.parent / 'baseline'))
+from gen_colliders import find_blocking_rectangles, get_trace_bounds
 from model import build_model
 
 
@@ -12,7 +17,9 @@ def load_model(checkpoint_path: str, device):
     model = build_model(
         num_queries=config.get('num_queries', 50),
         d_model=config.get('d_model', 256),
-        model_type=config.get('model_type', 'transformer')
+        model_type=config.get('model_type', 'transformer'),
+        use_baseline_colliders=config.get('use_baseline_colliders', True),
+        baseline_encoder_layers=config.get('baseline_encoder_layers', 2)
     )
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
@@ -255,9 +262,62 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
                               device=trace_tensor.device, dtype=trace_tensor.dtype)
             trace_tensor = torch.cat([trace_tensor, pad], dim=-1)
 
+    # Generate baseline colliders if model supports it
+    baseline_boxes = None
+    baseline_valid_mask = None
+    if hasattr(model, 'use_baseline_colliders') and model.use_baseline_colliders:
+        try:
+            # Generate baseline colliders
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                json.dump(traces, f)
+                temp_file = f.name
+            
+            try:
+                map_bounds = get_trace_bounds(traces, padding=3.0)
+                baseline_colliders = find_blocking_rectangles(
+                    temp_file,
+                    map_bounds=map_bounds,
+                    margin=0.3,
+                    max_distance=2.0,
+                    grid_size=0.1,
+                    min_block_size=0.5
+                )
+                Path(temp_file).unlink()
+                
+                # Convert to tensor format
+                if len(baseline_colliders) > 0:
+                    max_baseline = 50  # Same as max_colliders
+                    baseline_boxes_tensor = torch.zeros((1, max_baseline, 6), dtype=torch.float32)
+                    baseline_valid_tensor = torch.zeros((1, max_baseline), dtype=torch.bool)
+                    
+                    for i, col in enumerate(baseline_colliders[:max_baseline]):
+                        center = col.get('center', {})
+                        size = col.get('size', {})
+                        baseline_boxes_tensor[0, i] = torch.tensor([
+                            center.get('x', 0.0),
+                            center.get('y', 0.0),
+                            center.get('z', 0.0),
+                            size.get('x', 0.0),
+                            size.get('y', 0.0),
+                            size.get('z', 0.0)
+                        ], dtype=torch.float32)
+                        baseline_valid_tensor[0, i] = True
+                    
+                    baseline_boxes = baseline_boxes_tensor.to(device)
+                    baseline_valid_mask = baseline_valid_tensor.to(device)
+            except Exception as e:
+                if Path(temp_file).exists():
+                    Path(temp_file).unlink()
+                print(f"Warning: Failed to generate baseline colliders: {e}")
+        except Exception as e:
+            print(f"Warning: Could not generate baseline colliders: {e}")
+
     with torch.no_grad():
         try:
-            outputs = model(trace_tensor, mask)
+            if baseline_boxes is not None and baseline_valid_mask is not None:
+                outputs = model(trace_tensor, mask, baseline_boxes, baseline_valid_mask)
+            else:
+                outputs = model(trace_tensor, mask)
         except TypeError:
             outputs = model(trace_tensor)
 

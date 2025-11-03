@@ -4,6 +4,10 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import numpy as np
 from typing import List, Dict, Tuple
+import sys
+import tempfile
+sys.path.append(str(Path(__file__).parent.parent / 'baseline'))
+from gen_colliders import find_blocking_rectangles, get_trace_bounds
 
 
 class TraceColliderDataset(Dataset):
@@ -33,7 +37,12 @@ class TraceColliderDataset(Dataset):
             rotation_angles: list = [0, 90, 180, 270],
             scale_range: tuple = (0.8, 1.2),
             translation_range: float = 1.0,
-            collider_dropout_prob: float = 0.2
+            collider_dropout_prob: float = 0.2,
+            use_baseline_colliders: bool = True,
+            baseline_grid_size: float = 0.1,
+            baseline_min_block_size: float = 0.5,
+            baseline_margin: float = 0.3,
+            baseline_max_distance: float = 2.0
     ):
         """
         Args:
@@ -62,6 +71,13 @@ class TraceColliderDataset(Dataset):
         self.scale_range = scale_range
         self.translation_range = translation_range
         self.collider_dropout_prob = collider_dropout_prob
+
+        # Baseline collider settings
+        self.use_baseline_colliders = use_baseline_colliders
+        self.baseline_grid_size = baseline_grid_size
+        self.baseline_min_block_size = baseline_min_block_size
+        self.baseline_margin = baseline_margin
+        self.baseline_max_distance = baseline_max_distance
 
         # Label mapping
         self.label_to_id = {
@@ -294,6 +310,45 @@ class TraceColliderDataset(Dataset):
 
         return kept_colliders if kept_colliders else colliders  # Keep at least something
 
+    def _generate_baseline_colliders(self, traces: List[Dict]) -> List[Dict]:
+        """
+        Generate baseline colliders from trace data using the baseline rule-based generator.
+        
+        Args:
+            traces: List of trace points with x, y, z, timestamp
+            
+        Returns:
+            List of baseline collider dicts
+        """
+        if not self.use_baseline_colliders or len(traces) == 0:
+            return []
+        
+        # Create a temporary file with trace data
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(traces, f)
+            temp_file = f.name
+        
+        try:
+            # Generate baseline colliders
+            map_bounds = get_trace_bounds(traces, padding=self.baseline_max_distance + 1.0)
+            baseline_colliders = find_blocking_rectangles(
+                temp_file,
+                map_bounds=map_bounds,
+                margin=self.baseline_margin,
+                max_distance=self.baseline_max_distance,
+                grid_size=self.baseline_grid_size,
+                min_block_size=self.baseline_min_block_size
+            )
+            # Clean up temp file
+            Path(temp_file).unlink()
+            return baseline_colliders
+        except Exception as e:
+            # Clean up temp file on error
+            if Path(temp_file).exists():
+                Path(temp_file).unlink()
+            print(f"Warning: Failed to generate baseline colliders: {e}")
+            return []
+
     def __len__(self):
         return len(self.data_pairs)
 
@@ -374,9 +429,13 @@ class TraceColliderDataset(Dataset):
         if self.augment_collider_dropout and np.random.rand() < 0.5:
             colliders = self._dropout_colliders(colliders, self.collider_dropout_prob)
 
+        # Generate baseline colliders from augmented traces
+        baseline_colliders = self._generate_baseline_colliders(traces)
+
         # Process data
         trace_array = self._process_traces(traces)
         collider_boxes, collider_labels, collider_valid = self._process_colliders(colliders)
+        baseline_boxes, baseline_labels, baseline_valid = self._process_colliders(baseline_colliders)
 
         return {
             'traces': trace_array,
@@ -384,8 +443,12 @@ class TraceColliderDataset(Dataset):
             'boxes': collider_boxes,
             'labels': collider_labels,
             'valid_mask': collider_valid,
+            'baseline_boxes': baseline_boxes,
+            'baseline_labels': baseline_labels,
+            'baseline_valid_mask': baseline_valid,
             'num_traces': torch.tensor(len(traces), dtype=torch.long),
             'num_colliders': torch.tensor(len(colliders), dtype=torch.long),
+            'num_baseline_colliders': torch.tensor(len(baseline_colliders), dtype=torch.long),
             'filename': f"{pair['trace'].name}_rot{rotation_angle}",
             'rotation': torch.tensor(rotation_angle, dtype=torch.float32)
         }
@@ -536,8 +599,12 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'boxes': torch.stack([item['boxes'] for item in batch]),
         'labels': torch.stack([item['labels'] for item in batch]),
         'valid_mask': torch.stack([item['valid_mask'] for item in batch]),
+        'baseline_boxes': torch.stack([item['baseline_boxes'] for item in batch]),
+        'baseline_labels': torch.stack([item['baseline_labels'] for item in batch]),
+        'baseline_valid_mask': torch.stack([item['baseline_valid_mask'] for item in batch]),
         'num_traces': torch.stack([item['num_traces'] for item in batch]),
         'num_colliders': torch.stack([item['num_colliders'] for item in batch]),
+        'num_baseline_colliders': torch.stack([item['num_baseline_colliders'] for item in batch]),
     }
     return batched
 
@@ -556,7 +623,12 @@ def create_dataloader(
         rotation_angles: list = [0, 90, 180, 270],
         scale_range: tuple = (0.8, 1.2),
         translation_range: float = 1.0,
-        collider_dropout_prob: float = 0.2
+        collider_dropout_prob: float = 0.2,
+        use_baseline_colliders: bool = True,
+        baseline_grid_size: float = 0.1,
+        baseline_min_block_size: float = 0.5,
+        baseline_margin: float = 0.3,
+        baseline_max_distance: float = 2.0
 ) -> DataLoader:
     """
     Create dataloader with aggressive augmentation.
@@ -591,7 +663,12 @@ def create_dataloader(
         rotation_angles=rotation_angles,
         scale_range=scale_range,
         translation_range=translation_range,
-        collider_dropout_prob=collider_dropout_prob
+        collider_dropout_prob=collider_dropout_prob,
+        use_baseline_colliders=use_baseline_colliders,
+        baseline_grid_size=baseline_grid_size,
+        baseline_min_block_size=baseline_min_block_size,
+        baseline_margin=baseline_margin,
+        baseline_max_distance=baseline_max_distance
     )
 
     loader = DataLoader(

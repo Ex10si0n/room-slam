@@ -330,8 +330,16 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         labels = batch['labels'].to(device)
         valid_mask = batch['valid_mask'].to(device)
 
-        # Forward
-        outputs = model(traces, mask)
+        # Forward with baseline colliders if available
+        baseline_boxes = batch.get('baseline_boxes', None)
+        baseline_valid_mask = batch.get('baseline_valid_mask', None)
+        
+        if baseline_boxes is not None and baseline_valid_mask is not None:
+            baseline_boxes = baseline_boxes.to(device)
+            baseline_valid_mask = baseline_valid_mask.to(device)
+            outputs = model(traces, mask, baseline_boxes, baseline_valid_mask)
+        else:
+            outputs = model(traces, mask)
 
         targets = {
             'boxes': boxes,
@@ -420,7 +428,17 @@ def evaluate_metrics(model, dataloader, device, iou_thresh: float = 0.5):
         gt_labels = batch['labels'].to(device)
         gt_valid_mask = batch['valid_mask'].to(device)
 
-        outputs = model(traces, mask)
+        # Forward with baseline colliders if available
+        baseline_boxes = batch.get('baseline_boxes', None)
+        baseline_valid_mask = batch.get('baseline_valid_mask', None)
+        
+        if baseline_boxes is not None and baseline_valid_mask is not None:
+            baseline_boxes = baseline_boxes.to(device)
+            baseline_valid_mask = baseline_valid_mask.to(device)
+            outputs = model(traces, mask, baseline_boxes, baseline_valid_mask)
+        else:
+            outputs = model(traces, mask)
+            
         pred_boxes = outputs['pred_boxes']
         pred_classes = outputs['pred_classes']
         pred_labels = pred_classes.argmax(dim=-1)
@@ -556,7 +574,16 @@ def validate(model, dataloader, criterion, device):
             labels = batch['labels'].to(device)
             valid_mask = batch['valid_mask'].to(device)
 
-            outputs = model(traces, mask)
+            # Forward with baseline colliders if available
+            baseline_boxes = batch.get('baseline_boxes', None)
+            baseline_valid_mask = batch.get('baseline_valid_mask', None)
+            
+            if baseline_boxes is not None and baseline_valid_mask is not None:
+                baseline_boxes = baseline_boxes.to(device)
+                baseline_valid_mask = baseline_valid_mask.to(device)
+                outputs = model(traces, mask, baseline_boxes, baseline_valid_mask)
+            else:
+                outputs = model(traces, mask)
             targets = {
                 'boxes': boxes,
                 'labels': labels,
@@ -609,7 +636,9 @@ def main():
         'val_dir': '../../dataset/val',
         'save_dir': f'./checkpoints_{args.stage_name}',
         'val_every': 1,
-        'iou_thresh': 0.5
+        'iou_thresh': 0.5,
+        'use_baseline_colliders': True,
+        'baseline_encoder_layers': 2
     }
 
     # Create save directory
@@ -635,7 +664,8 @@ def main():
         rotation_angles=[0, 90, 180, 270],
         scale_range=(0.8, 1.2),
         translation_range=1.0,
-        collider_dropout_prob=args.dropout_prob
+        collider_dropout_prob=args.dropout_prob,
+        use_baseline_colliders=True
     )
 
     val_loader = create_dataloader(
@@ -645,14 +675,17 @@ def main():
         augment_rotation=False,
         augment_translation=False,
         augment_scale=False,
-        augment_collider_dropout=False
+        augment_collider_dropout=False,
+        use_baseline_colliders=True
     )
 
     # Build model
     model = build_model(
         num_queries=config['num_queries'],
         d_model=config['d_model'],
-        model_type=config.get('model_type', 'transformer')
+        model_type=config.get('model_type', 'transformer'),
+        use_baseline_colliders=True,
+        baseline_encoder_layers=2
     ).to(device)
 
     # Count parameters

@@ -245,6 +245,55 @@ class TransformerTraceEncoder(nn.Module):
         return memory, coords, mean, scale
 
 
+class BaselineColliderEncoder(nn.Module):
+    """Encoder for baseline collider boxes"""
+    
+    def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 2):
+        super().__init__()
+        # Input: boxes [B, M, 6] (cx, cy, cz, sx, sy, sz)
+        self.input_proj = nn.Linear(6, d_model)
+        
+        # Optional: Add positional encoding for colliders
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Output projection to combine with trace features
+        self.output_proj = nn.Linear(d_model, d_model)
+    
+    def forward(
+        self, 
+        baseline_boxes: torch.Tensor, 
+        baseline_valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            baseline_boxes: [B, M, 6] tensor of baseline collider boxes
+            baseline_valid_mask: [B, M] bool tensor (True for valid colliders)
+            
+        Returns:
+            baseline_features: [B, M, d_model] encoded baseline collider features
+        """
+        B, M, _ = baseline_boxes.shape
+        
+        # Project boxes to feature space
+        x = self.input_proj(baseline_boxes)  # [B, M, d_model]
+        
+        # Apply transformer encoder
+        src_key_padding_mask = ~baseline_valid_mask if baseline_valid_mask is not None else None
+        encoded = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+        
+        # Output projection
+        output = self.output_proj(encoded)
+        
+        return output
+
+
 class ColliderDecoder(nn.Module):
 
     def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 3, num_queries: int = 30):
@@ -382,18 +431,35 @@ class MLP(nn.Module):
 
 
 class TraceToColliderTransformer(nn.Module):
-    """Trace -> Colliders with improved decoder"""
+    """Trace -> Colliders with improved decoder and baseline collider support"""
 
     def __init__(self, d_model: int = 128, nhead: int = 4,
                  num_encoder_layers: int = 3, num_decoder_layers: int = 3,
-                 num_queries: int = 30):
+                 num_queries: int = 30, use_baseline_colliders: bool = True,
+                 baseline_encoder_layers: int = 2):
         super().__init__()
+
+        self.use_baseline_colliders = use_baseline_colliders
 
         self.encoder = TransformerTraceEncoder(
             d_model=d_model,
             nhead=nhead,
             num_layers=num_encoder_layers
         )
+
+        if self.use_baseline_colliders:
+            self.baseline_encoder = BaselineColliderEncoder(
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=baseline_encoder_layers
+            )
+            # Fusion layer to combine trace and baseline features
+            self.fusion = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(d_model, d_model)
+            )
 
         self.decoder = ColliderDecoder(
             d_model=d_model,
@@ -402,8 +468,35 @@ class TraceToColliderTransformer(nn.Module):
             num_queries=num_queries
         )
 
-    def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self, 
+        traces: torch.Tensor, 
+        mask: Optional[torch.Tensor] = None,
+        baseline_boxes: Optional[torch.Tensor] = None,
+        baseline_valid_mask: Optional[torch.Tensor] = None
+    ):
+        # Encode traces
         memory, coords, mean, scale = self.encoder(traces, mask)
+        
+        # Encode baseline colliders if provided
+        if self.use_baseline_colliders and baseline_boxes is not None and baseline_valid_mask is not None:
+            baseline_features = self.baseline_encoder(baseline_boxes, baseline_valid_mask)
+            
+            # Combine trace memory with baseline features
+            # Strategy: Cross-attend baseline features into trace memory
+            B, N, D = memory.shape
+            B_b, M, D_b = baseline_features.shape
+            
+            # Use cross-attention to fuse baseline features into trace memory
+            # Create a simple fusion by attending to baseline features
+            # We'll use a learned weighted combination
+            baseline_pooled = baseline_features.mean(dim=1, keepdim=True)  # [B, 1, D]
+            baseline_expanded = baseline_pooled.expand(B, N, D)  # [B, N, D]
+            
+            # Concatenate and fuse
+            combined = torch.cat([memory, baseline_expanded], dim=-1)  # [B, N, 2*D]
+            memory = self.fusion(combined)  # [B, N, D]
+        
         boxes, classes = self.decoder(memory, coords, mean, scale, mask)
         return {
             'pred_boxes': boxes,
@@ -420,7 +513,9 @@ def build_model(
         dec_layers: int = 6,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        lstm_layers: int = 2
+        lstm_layers: int = 2,
+        use_baseline_colliders: bool = True,
+        baseline_encoder_layers: int = 2
 ):
     """Build model by type."""
     model_type = model_type.lower()
@@ -430,10 +525,13 @@ def build_model(
             nhead=nhead,
             num_encoder_layers=enc_layers,
             num_decoder_layers=dec_layers,
-            num_queries=num_queries
+            num_queries=num_queries,
+            use_baseline_colliders=use_baseline_colliders,
+            baseline_encoder_layers=baseline_encoder_layers
         )
         print(f"[build_model] Transformer: d_model={d_model}, heads={nhead}, "
-              f"enc/dec={enc_layers}/{dec_layers}, queries={num_queries}")
+              f"enc/dec={enc_layers}/{dec_layers}, queries={num_queries}, "
+              f"baseline={use_baseline_colliders}")
         return model
 
     elif model_type == "lstm":
