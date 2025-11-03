@@ -58,7 +58,13 @@ class TraceColliderDataset(Dataset):
             translation_range: Maximum translation in meters
             collider_dropout_prob: Probability of dropping each collider
         """
-        self.data_dir = Path(data_dir)
+        # Resolve data directory path
+        self.data_dir = Path(data_dir).resolve()
+        if not self.data_dir.exists():
+            raise ValueError(f"Data directory does not exist: {self.data_dir}")
+        if not self.data_dir.is_dir():
+            raise ValueError(f"Data directory is not a directory: {self.data_dir}")
+        
         self.max_trace_len = max_trace_len
         self.max_colliders = max_colliders
 
@@ -124,27 +130,34 @@ class TraceColliderDataset(Dataset):
         pairs = []
 
         # Pattern 2 & 3: agent_data_* / human_data_* with shared colliders.json
-        if len(pairs) == 0:
-            # Look for shared colliders.json
-            shared_collider = self.data_dir / "colliders.json"
+        # Look for shared colliders.json
+        shared_collider = self.data_dir / "colliders.json"
 
-            if shared_collider.exists():
-                # Find all agent and human data files
-                agent_files = sorted(self.data_dir.glob("agent_data_*.json"))
-                human_files = sorted(self.data_dir.glob("human_data_*.json"))
+        if shared_collider.exists():
+            # Find all agent and human data files
+            agent_files = sorted(self.data_dir.glob("agent_data_*.json"))
+            human_files = sorted(self.data_dir.glob("human_data_*.json"))
 
-                all_trace_files = agent_files + human_files
+            all_trace_files = agent_files + human_files
 
-                for trace_file in all_trace_files:
-                    pairs.append({
-                        'trace': trace_file,
-                        'collider': shared_collider
-                    })
+            for trace_file in all_trace_files:
+                pairs.append({
+                    'trace': trace_file,
+                    'collider': shared_collider
+                })
 
-                if len(all_trace_files) > 0:
-                    print(f"Using shared colliders.json for {len(all_trace_files)} trace files")
+            if len(all_trace_files) > 0:
+                print(f"Using shared colliders.json for {len(all_trace_files)} trace files")
             else:
-                print("Warning: No colliders.json found")
+                print(f"Warning: Found colliders.json but no agent_data_*.json or human_data_*.json files in {self.data_dir}")
+        else:
+            print(f"Warning: No colliders.json found in {self.data_dir}")
+            # Try to find any JSON files to help debug
+            all_json_files = list(self.data_dir.glob("*.json"))
+            if all_json_files:
+                print(f"Found {len(all_json_files)} JSON files: {[f.name for f in all_json_files[:5]]}")
+            else:
+                print(f"No JSON files found in {self.data_dir}")
 
         return pairs
 
