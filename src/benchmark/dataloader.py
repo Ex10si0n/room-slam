@@ -58,12 +58,27 @@ class TraceColliderDataset(Dataset):
             translation_range: Maximum translation in meters
             collider_dropout_prob: Probability of dropping each collider
         """
-        # Resolve data directory path
-        self.data_dir = Path(data_dir).resolve()
+        # Resolve data directory path relative to this script's location
+        # This allows relative paths like '../../dataset/train' to work correctly
+        script_dir = Path(__file__).parent
+        data_path = Path(data_dir)
+        
+        if data_path.is_absolute():
+            self.data_dir = data_path
+        else:
+            # Resolve relative to script directory first, then to absolute
+            self.data_dir = (script_dir / data_path).resolve()
+        
         if not self.data_dir.exists():
-            raise ValueError(f"Data directory does not exist: {self.data_dir}")
+            raise ValueError(f"Data directory does not exist: {self.data_dir}\n"
+                           f"Original path: {data_dir}\n"
+                           f"Script directory: {script_dir}\n"
+                           f"Current working directory: {Path.cwd()}")
         if not self.data_dir.is_dir():
             raise ValueError(f"Data directory is not a directory: {self.data_dir}")
+        
+        # Debug: print resolved path
+        print(f"Data directory resolved: {data_dir} -> {self.data_dir}")
         
         self.max_trace_len = max_trace_len
         self.max_colliders = max_colliders
