@@ -111,6 +111,27 @@ class TraceColliderDataset(Dataset):
         # Load file pairs
         self.base_data_pairs = self._load_data_pairs()
         print(f"Found {len(self.base_data_pairs)} base samples in {data_dir}")
+        
+        # Cache for baseline colliders (generate once per trace file)
+        self.baseline_cache = {}
+        if self.use_baseline_colliders:
+            print("Pre-generating baseline colliders for all trace files...")
+            for pair in self.base_data_pairs:
+                trace_file = pair['trace']
+                cache_key = str(trace_file)
+                if cache_key not in self.baseline_cache:
+                    try:
+                        # Load original trace data
+                        with open(trace_file, 'r') as f:
+                            trace_data = json.load(f)
+                        traces = trace_data if isinstance(trace_data, list) else []
+                        if len(traces) > 0:
+                            baseline_colliders = self._generate_baseline_colliders(traces)
+                            self.baseline_cache[cache_key] = baseline_colliders
+                    except Exception as e:
+                        print(f"Warning: Failed to pre-generate baseline for {trace_file}: {e}")
+                        self.baseline_cache[cache_key] = []
+            print(f"Pre-generated baseline colliders for {len(self.baseline_cache)} trace files")
 
         # Expand dataset with rotations
         if self.augment_rotation:
@@ -402,6 +423,10 @@ class TraceColliderDataset(Dataset):
         traces = trace_data if isinstance(trace_data, list) else []
         colliders = collider_data.get('colliders', [])
 
+        # Initialize augmentation parameters (needed for baseline colliders)
+        tx, tz = 0.0, 0.0
+        scale = 1.0
+
         # Apply rotation augmentation
         if rotation_angle != 0:
             traces = self._rotate_traces(traces, rotation_angle)
@@ -457,8 +482,24 @@ class TraceColliderDataset(Dataset):
         if self.augment_collider_dropout and np.random.rand() < 0.5:
             colliders = self._dropout_colliders(colliders, self.collider_dropout_prob)
 
-        # Generate baseline colliders from augmented traces
-        baseline_colliders = self._generate_baseline_colliders(traces)
+        # Get baseline colliders (from cache) and apply augmentations
+        baseline_colliders = []
+        if self.use_baseline_colliders:
+            cache_key = str(pair['trace'])
+            baseline_colliders = self.baseline_cache.get(cache_key, []).copy()
+            
+            # Apply the same augmentations to baseline colliders as were applied to traces
+            if rotation_angle != 0:
+                baseline_colliders = self._rotate_colliders(baseline_colliders, rotation_angle)
+            
+            if self.augment_translation and (tx != 0.0 or tz != 0.0):
+                baseline_colliders = self._translate_colliders(baseline_colliders, tx, tz)
+            
+            if self.augment_scale and scale != 1.0:
+                baseline_colliders = self._scale_colliders(baseline_colliders, scale)
+            
+            # Note: We skip noise/cropping/time-warping for baseline colliders
+            # as these don't preserve geometry well for the baseline generator
 
         # Process data
         trace_array = self._process_traces(traces)
