@@ -257,6 +257,18 @@ class SetCriterion(nn.Module):
         losses['coverage_loss'] = alignment_losses['coverage']
         losses['avoidance_loss'] = alignment_losses['avoidance']
 
+        # Diversity regularization: encourage predictions to be trace-dependent
+        # Penalize predictions that are too uniform across batch
+        if pred_boxes.shape[0] > 1:
+            # Compute variance of predictions across batch (should be high for diverse predictions)
+            pred_var = pred_boxes.var(dim=0).mean()  # Average variance across queries
+            # We want this to be high, so we minimize the negative (or use a small penalty)
+            # Small penalty to avoid over-penalizing (only if variance is very low)
+            diversity_loss = -0.01 * pred_var.clamp(max=1.0)  # Small penalty for low variance
+            losses['diversity_loss'] = diversity_loss
+        else:
+            losses['diversity_loss'] = torch.tensor(0.0, device=pred_boxes.device)
+
         # Total loss
         total_loss = sum(losses[k] * self.weight_dict.get(k, 1.0) for k in losses.keys())
         losses['total_loss'] = total_loss
@@ -364,7 +376,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
             'l1': f"{losses['l1_loss'].item():.4f}",
             'giou': f"{losses['giou_loss'].item():.4f}",
             'cov': f"{losses['coverage_loss'].item():.4f}",
-            'avoid': f"{losses['avoidance_loss'].item():.4f}"
+            'avoid': f"{losses['avoidance_loss'].item():.4f}",
+            'div': f"{losses['diversity_loss'].item():.4f}"
         })
 
     return total_loss / len(dataloader)
@@ -697,7 +710,8 @@ def main():
         'l1_loss': 5.0,
         'giou_loss': 2.0,
         'coverage_loss': args.cov_weight,
-        'avoidance_loss': args.avoid_weight
+        'avoidance_loss': args.avoid_weight,
+        'diversity_loss': 0.1  # Small weight for diversity regularization
     }
     print(f"Using weights: {weight_dict}")
     criterion = SetCriterion(weight_dict)

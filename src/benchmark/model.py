@@ -453,13 +453,20 @@ class TraceToColliderTransformer(nn.Module):
                 nhead=nhead,
                 num_layers=baseline_encoder_layers
             )
-            # Fusion layer to combine trace and baseline features
-            self.fusion = nn.Sequential(
+            # Cross-attention for spatial-aware fusion
+            # Trace positions attend to relevant baseline colliders
+            self.cross_attn = nn.MultiheadAttention(
+                d_model, num_heads=nhead, batch_first=True, dropout=0.1
+            )
+            # Learnable gating to control baseline influence
+            self.baseline_gate = nn.Sequential(
                 nn.Linear(d_model * 2, d_model),
                 nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(d_model, d_model)
+                nn.Linear(d_model, 1),
+                nn.Sigmoid()
             )
+            # Residual fusion
+            self.fusion_norm = nn.LayerNorm(d_model)
 
         self.decoder = ColliderDecoder(
             d_model=d_model,
@@ -482,20 +489,33 @@ class TraceToColliderTransformer(nn.Module):
         if self.use_baseline_colliders and baseline_boxes is not None and baseline_valid_mask is not None:
             baseline_features = self.baseline_encoder(baseline_boxes, baseline_valid_mask)
             
-            # Combine trace memory with baseline features
-            # Strategy: Cross-attend baseline features into trace memory
+            # Use cross-attention: trace positions attend to relevant baseline colliders
+            # This allows trace-specific attention to baseline features
             B, N, D = memory.shape
             B_b, M, D_b = baseline_features.shape
             
-            # Use cross-attention to fuse baseline features into trace memory
-            # Create a simple fusion by attending to baseline features
-            # We'll use a learned weighted combination
-            baseline_pooled = baseline_features.mean(dim=1, keepdim=True)  # [B, 1, D]
-            baseline_expanded = baseline_pooled.expand(B, N, D)  # [B, N, D]
+            # Cross-attention: memory (queries) attends to baseline_features (keys/values)
+            baseline_key_padding = ~baseline_valid_mask if baseline_valid_mask is not None else None
+            attended_memory, attn_weights = self.cross_attn(
+                memory,  # queries: [B, N, D]
+                baseline_features,  # keys: [B, M, D]
+                baseline_features,  # values: [B, M, D]
+                key_padding_mask=baseline_key_padding
+            )
             
-            # Concatenate and fuse
-            combined = torch.cat([memory, baseline_expanded], dim=-1)  # [B, N, 2*D]
-            memory = self.fusion(combined)  # [B, N, D]
+            # Learnable gating: control how much to use baseline vs trace features
+            # Gate is computed per trace position, making it trace-dependent
+            gate_input = torch.cat([memory, attended_memory], dim=-1)  # [B, N, 2*D]
+            gate = self.baseline_gate(gate_input)  # [B, N, 1]
+            
+            # Gated fusion: trace features + gated baseline features
+            # During training, we can add dropout to baseline features to force trace reliance
+            if self.training:
+                # Slight dropout on attended baseline features to encourage trace learning
+                attended_memory = F.dropout(attended_memory, p=0.1, training=self.training)
+            
+            memory = memory + gate * attended_memory
+            memory = self.fusion_norm(memory)
         
         boxes, classes = self.decoder(memory, coords, mean, scale, mask)
         return {
