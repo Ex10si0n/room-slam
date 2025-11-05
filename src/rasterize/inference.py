@@ -1,7 +1,7 @@
 import torch
 import json
 import argparse
-
+import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 from model import build_model
@@ -26,34 +26,52 @@ def load_model(checkpoint_path: str, device):
 
 def process_traces(traces, max_len: int = 3000):
     """
-    Convert trace list to a [N,11] tensor:
-        [x,y,z,t, vx,vy,vz, ax,ay,az, speed]
+    Convert trace list to a [N,7] tensor (2D version):
+        [x, z, vx, vz, ax, az, speed]
     """
-    import numpy as np
-
     if len(traces) == 0:
-        return torch.zeros((1, 11), dtype=torch.float32)
+        return torch.zeros((1, 7), dtype=torch.float32)
 
-    # Raw array [N, 4]
-    arr = np.array(
-        [[p['x'], p['y'], p['z'], p['timestamp']] for p in traces],
-        dtype=np.float32
-    )
+    # Collect x, z, timestamp
+    trace_list = []
+    for p in traces:
+        trace_list.append([
+            p.get('x', 0.0),
+            p.get('z', 0.0),
+            p.get('timestamp', 0.0)
+        ])
 
-    # Sort by time & normalize time to start at 0
-    order = np.argsort(arr[:, 3])
-    arr = arr[order]
-    arr[:, 3] -= arr[0, 3]
+    trace_array = np.array(trace_list, dtype=np.float32)  # [N, 3]
 
-    # Kinematic features (order-sensitive)
-    diffs = np.diff(arr, axis=0, prepend=arr[[0], :])
-    dt = np.clip(diffs[:, 3], 1e-3, None)
-    vel = diffs[:, :3] / dt[:, None]                    # [N,3]
-    acc = np.diff(vel, axis=0, prepend=vel[[0], :])     # [N,3]
-    speed = np.linalg.norm(vel, axis=1, keepdims=True)  # [N,1]
-    kin = np.concatenate([vel, acc, speed], axis=1)     # [N,7]
+    # Sort by timestamp
+    if trace_array.shape[0] > 1:
+        order = np.argsort(trace_array[:, 2])
+        trace_array = trace_array[order]
 
-    feats = np.concatenate([arr, kin], axis=1).astype(np.float32)  # [N,11]
+    # Normalize time
+    if trace_array.shape[0] > 0:
+        trace_array[:, 2] -= trace_array[0, 2]
+
+    # Compute 2D kinematics
+    diffs = np.diff(trace_array, axis=0, prepend=trace_array[[0], :])  # [N, 3]
+    dt = np.clip(diffs[:, 2], 1e-3, None)  # [N]
+
+    # 2D velocity (x, z only)
+    vel = diffs[:, :2] / dt[:, None]  # [N, 2]
+    vel = np.clip(vel, -10.0, 10.0)
+
+    # 2D acceleration
+    vel_diffs = np.diff(vel, axis=0, prepend=vel[[0], :])  # [N, 2]
+    acc = vel_diffs / dt[:, None]  # [N, 2]
+    acc = np.clip(acc, -20.0, 20.0)
+
+    # 2D speed
+    speed = np.linalg.norm(vel, axis=1, keepdims=True)  # [N, 1]
+
+    # Concatenate: [x, z] + [vx, vz] + [ax, az] + [speed]
+    # Result: [N, 2+2+2+1 = 7]
+    kin = np.concatenate([vel, acc, speed], axis=1)  # [N, 5]
+    feats = np.concatenate([trace_array[:, :2], kin], axis=1)  # [N, 7]
 
     # Downsample to max_len
     if feats.shape[0] > max_len:
@@ -61,22 +79,20 @@ def process_traces(traces, max_len: int = 3000):
         idx = np.linspace(0, feats.shape[0] - 1, max_len, dtype=int)
         feats = feats[idx]
 
-    return torch.from_numpy(feats)  # [N,11]
+    return torch.from_numpy(feats.astype(np.float32))  # [N, 7]
 
 
 def rasterize_traces_to_grid(traces, grid_size: int = 64):
     """
-    Rasterize 3D traces into a top-down 2D grid (Walk2Map-style inverse-distance map).
+    Rasterize traces into a top-down 2D grid (Walk2Map-style inverse-distance map).
 
     Args:
-        traces: list of dicts, each with keys x, y, z, timestamp
+        traces: list of dicts, each with keys x, z (y ignored)
         grid_size: output grid size (H = W = grid_size)
 
     Returns:
         grid: [1, H, W] float32 tensor in [0,1]
     """
-    import numpy as np
-
     H = W = grid_size
 
     if len(traces) == 0:
@@ -107,41 +123,41 @@ def rasterize_traces_to_grid(traces, grid_size: int = 64):
 
     inv = 1.0 - dist  # closer to trace = higher value
 
-    return torch.from_numpy(inv.astype(np.float32)).unsqueeze(0)  # [1,H,W]
+    return torch.from_numpy(inv.astype(np.float32)).unsqueeze(0)  # [1, H, W]
 
 
-def compute_iou_3d(box1, box2):
+def compute_iou_2d(box1, box2):
     """
-    Compute 3D IoU between two boxes.
-    box: [cx, cy, cz, sx, sy, sz]
+    Compute 2D IoU between two boxes.
+    box: [cx, cz, sx, sz]
     """
     # Convert to corner format
-    box1_min = box1[:3] - box1[3:] / 2
-    box1_max = box1[:3] + box1[3:] / 2
-    box2_min = box2[:3] - box2[3:] / 2
-    box2_max = box2[:3] + box2[3:] / 2
+    box1_min = box1[:2] - box1[2:] / 2
+    box1_max = box1[:2] + box1[2:] / 2
+    box2_min = box2[:2] - box2[2:] / 2
+    box2_max = box2[:2] + box2[2:] / 2
 
     # Intersection
     inter_min = torch.maximum(box1_min, box2_min)
     inter_max = torch.minimum(box1_max, box2_max)
     inter_size = torch.clamp(inter_max - inter_min, min=0)
-    inter_volume = inter_size.prod()
+    inter_area = inter_size.prod()
 
     # Union
-    box1_volume = box1[3:].prod()
-    box2_volume = box2[3:].prod()
-    union_volume = box1_volume + box2_volume - inter_volume
+    box1_area = box1[2:].prod()
+    box2_area = box2[2:].prod()
+    union_area = box1_area + box2_area - inter_area
 
-    iou = inter_volume / (union_volume + 1e-6)
+    iou = inter_area / (union_area + 1e-6)
     return iou.item()
 
 
-def nms_3d(boxes, scores, iou_threshold=0.5):
+def nms_2d(boxes, scores, iou_threshold=0.5):
     """
-    Non-Maximum Suppression for 3D boxes.
+    Non-Maximum Suppression for 2D boxes.
 
     Args:
-        boxes: [N, 6] tensor
+        boxes: [N, 4] tensor (cx, cz, sx, sz)
         scores: [N] tensor
         iou_threshold: IoU threshold for suppression
 
@@ -166,7 +182,7 @@ def nms_3d(boxes, scores, iou_threshold=0.5):
 
         new_remaining = []
         for idx in remaining_indices:
-            iou = compute_iou_3d(current_box, boxes[idx])
+            iou = compute_iou_2d(current_box, boxes[idx])
             if iou < iou_threshold:
                 new_remaining.append(idx)
 
@@ -183,15 +199,15 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
     Filter and format predictions with per-class NMS.
 
     Args:
-        boxes: [Q, 6]
+        boxes: [Q, 4] (cx, cz, sx, sz)
         classes: [Q, 3] logits
 
     Returns:
-        List[dict]: collider objects in BoxCollider-style format
+        List[dict]: collider objects in BoxCollider-style format (with y=0)
     """
     label_map = {0: 'BLOCK', 1: 'LOW', 2: 'MID'}
 
-    probs = torch.softmax(classes, dim=-1)   # [Q,3]
+    probs = torch.softmax(classes, dim=-1)  # [Q, 3]
     max_probs, pred_labels = probs.max(dim=-1)
 
     valid_mask = max_probs > confidence_threshold
@@ -206,6 +222,7 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
 
     final_indices = []
 
+    # Per-class NMS
     for label_id in range(3):
         class_mask = valid_labels == label_id
         class_indices = torch.nonzero(class_mask, as_tuple=False).squeeze(-1)
@@ -217,7 +234,7 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
         class_boxes = valid_boxes[class_indices]
         class_scores = valid_scores[class_indices]
 
-        keep_in_class = nms_3d(class_boxes, class_scores, nms_threshold)
+        keep_in_class = nms_2d(class_boxes, class_scores, nms_threshold)
 
         for k in keep_in_class:
             final_indices.append(class_indices[k].item())
@@ -228,19 +245,20 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
         label = label_map[valid_labels[idx].item()]
         conf = valid_scores[idx].item()
 
+        # Convert 2D box to 3D format (y=0, sy=default height)
         predictions.append({
             'type': 'BoxCollider',
             'label': label,
             'confidence': float(conf),
             'center': {
                 'x': float(box[0]),
-                'y': float(box[1]),
-                'z': float(box[2])
+                'y': 0.0,  # Default ground level
+                'z': float(box[1])
             },
             'size': {
-                'x': float(box[3]),
-                'y': float(box[4]),
-                'z': float(box[5])
+                'x': float(box[2]),
+                'y': 2.0,  # Default height for visualization
+                'z': float(box[3])
             },
             'radius': 0.0,
             'height': 0.0
@@ -251,7 +269,7 @@ def post_process_predictions(boxes, classes, confidence_threshold=0.7, nms_thres
 
 def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=0.3):
     """
-    Run prediction on a trace JSON file with a trace+grid Transformer model.
+    Run prediction on a trace JSON file with a 2D trace+grid Transformer model.
     """
     # Load traces
     with open(traces_file, 'r') as f:
@@ -262,28 +280,16 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
         print("Warning: No traces found in file")
         return []
 
-    # Build trace features
-    out = process_traces(traces)
-    if isinstance(out, tuple):
-        if len(out) >= 2:
-            trace_tensor, mask = out[0], out[1]
-        elif len(out) == 1:
-            trace_tensor = out[0]
-            mask = torch.ones(trace_tensor.shape[0], dtype=torch.bool)
-        else:
-            raise ValueError("process_traces returned an empty tuple.")
-    else:
-        trace_tensor = out
-        mask = torch.ones(trace_tensor.shape[0], dtype=torch.bool)
+    # Build 2D trace features [N, 7]
+    trace_tensor = process_traces(traces)
 
     if not isinstance(trace_tensor, torch.Tensor):
         trace_tensor = torch.as_tensor(trace_tensor, dtype=torch.float32)
-    if not isinstance(mask, torch.Tensor):
-        mask = torch.as_tensor(mask, dtype=torch.bool)
 
     # Add batch dimension
-    trace_tensor = trace_tensor.unsqueeze(0).to(device)  # [1, N, F]
-    mask = mask.unsqueeze(0).to(device)                  # [1, N]
+    trace_tensor = trace_tensor.unsqueeze(0).to(device)  # [1, N, 7]
+    mask = torch.ones(trace_tensor.shape[1], dtype=torch.bool)
+    mask = mask.unsqueeze(0).to(device)  # [1, N]
 
     # Match feature dimension if needed
     in_feat = None
@@ -309,12 +315,12 @@ def predict(model, traces_file, device, confidence_threshold=0.7, nms_threshold=
 
     # Build grid map from traces (Walk2Map-style inverse-distance map)
     grid_map = rasterize_traces_to_grid(traces, grid_size=64)  # [1, H, W]
-    grid_map = grid_map.unsqueeze(0).to(device)                # [1,1,H,W]
+    grid_map = grid_map.unsqueeze(0).to(device)  # [1, 1, H, W]
 
     with torch.no_grad():
         outputs = model(trace_tensor, mask, grid_maps=grid_map)
 
-    pred_boxes = outputs['pred_boxes'][0]      # [Q, 6]
+    pred_boxes = outputs['pred_boxes'][0]  # [Q, 4]
     pred_classes = outputs['pred_classes'][0]  # [Q, 3]
     predictions = post_process_predictions(
         pred_boxes, pred_classes,
@@ -358,7 +364,8 @@ def main():
     for i, pred in enumerate(predictions):
         print(
             f"  {i + 1}. {pred['label']} at "
-            f"({pred['center']['x']:.2f}, {pred['center']['y']:.2f}, {pred['center']['z']:.2f}) "
+            f"({pred['center']['x']:.2f}, {pred['center']['z']:.2f}) "
+            f"size: ({pred['size']['x']:.2f} x {pred['size']['z']:.2f}) "
             f"- confidence: {pred['confidence']:.3f}"
         )
 
@@ -369,7 +376,8 @@ def main():
             'metadata': {
                 'num_colliders': len(predictions),
                 'confidence_threshold': args.threshold,
-                'nms_threshold': args.nms
+                'nms_threshold': args.nms,
+                'note': '2D model - y coordinates set to 0, y sizes set to 2.0 for visualization'
             }
         }
 

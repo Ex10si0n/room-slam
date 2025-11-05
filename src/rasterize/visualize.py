@@ -9,8 +9,8 @@ import torch
 from inference import load_model, predict
 
 
-def plot_top_view(traces, colliders, predictions=None, title="Top View"):
-    """Plot top-down view (X-Z plane)."""
+def plot_top_view(traces, colliders, predictions=None, title="Top View (X-Z Plane)"):
+    """Plot top-down view (X-Z plane) - main view for 2D model."""
     fig, ax = plt.subplots(figsize=(12, 10))
 
     # Plot traces
@@ -42,7 +42,7 @@ def plot_top_view(traces, colliders, predictions=None, title="Top View"):
             ax.text(
                 center['x'], center['z'], label,
                 ha='center', va='center',
-                fontsize=8, color='red'
+                fontsize=8, color='red', weight='bold'
             )
 
     # Plot predictions
@@ -68,27 +68,30 @@ def plot_top_view(traces, colliders, predictions=None, title="Top View"):
             ax.text(
                 center['x'], center['z'], f"{label}\n{conf:.2f}",
                 ha='center', va='center',
-                fontsize=7, color='blue'
+                fontsize=7, color='blue', weight='bold'
             )
 
-    ax.set_xlabel('X Position')
-    ax.set_ylabel('Z Position')
-    ax.set_title(title)
-    ax.legend()
+    ax.set_xlabel('X Position (m)', fontsize=12)
+    ax.set_ylabel('Z Position (m)', fontsize=12)
+    ax.set_title(title, fontsize=14, weight='bold')
+    ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal')
 
     return fig
 
 
-def plot_side_view(traces, colliders, predictions=None, title="Side View"):
-    """Plot side view (X-Y plane)."""
+def plot_side_view(traces, colliders, predictions=None, title="Side View (X-Y Plane)"):
+    """
+    Plot side view (X-Y plane).
+    Note: For 2D models, y coordinates are set to 0, so this view may not be meaningful.
+    """
     fig, ax = plt.subplots(figsize=(12, 6))
 
     # Plot traces
     if traces:
         x = [p['x'] for p in traces]
-        y = [p['y'] for p in traces]
+        y = [p.get('y', 0.0) for p in traces]  # Default to 0 if y not present
         ax.plot(x, y, 'b-', alpha=0.5, linewidth=0.5, label='Trace')
 
     # Plot ground-truth colliders
@@ -99,8 +102,8 @@ def plot_side_view(traces, colliders, predictions=None, title="Side View"):
             label = col.get('label', 'BLOCK')
 
             rect = Rectangle(
-                (center['x'] - size['x'] / 2, center['y'] - size['y'] / 2),
-                size['x'], size['y'],
+                (center['x'] - size['x'] / 2, center.get('y', 0.0) - size.get('y', 2.0) / 2),
+                size['x'], size.get('y', 2.0),
                 linewidth=2,
                 edgecolor='red',
                 facecolor='red',
@@ -110,9 +113,9 @@ def plot_side_view(traces, colliders, predictions=None, title="Side View"):
             ax.add_patch(rect)
 
             ax.text(
-                center['x'], center['y'], label,
+                center['x'], center.get('y', 0.0), label,
                 ha='center', va='center',
-                fontsize=8, color='red'
+                fontsize=8, color='red', weight='bold'
             )
 
     # Plot predictions
@@ -123,8 +126,8 @@ def plot_side_view(traces, colliders, predictions=None, title="Side View"):
             label = pred.get('label', 'PRED')
 
             rect = Rectangle(
-                (center['x'] - size['x'] / 2, center['y'] - size['y'] / 2),
-                size['x'], size['y'],
+                (center['x'] - size['x'] / 2, center.get('y', 0.0) - size.get('y', 2.0) / 2),
+                size['x'], size.get('y', 2.0),
                 linewidth=2,
                 edgecolor='blue',
                 facecolor='none',
@@ -135,17 +138,26 @@ def plot_side_view(traces, colliders, predictions=None, title="Side View"):
             ax.add_patch(rect)
 
             ax.text(
-                center['x'], center['y'], label,
+                center['x'], center.get('y', 0.0), label,
                 ha='center', va='center',
-                fontsize=7, color='blue'
+                fontsize=7, color='blue', weight='bold'
             )
 
-    ax.set_xlabel('X Position')
-    ax.set_ylabel('Y Position (Height)')
-    ax.set_title(title)
-    ax.legend()
+    ax.set_xlabel('X Position (m)', fontsize=12)
+    ax.set_ylabel('Y Position / Height (m)', fontsize=12)
+    ax.set_title(title, fontsize=14, weight='bold')
+    ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal')
+
+    # Add note for 2D models
+    if predictions and all(p['center'].get('y', 0.0) == 0.0 for p in predictions):
+        ax.text(
+            0.5, 0.02,
+            'Note: Y coordinates from 2D model (all set to ground level)',
+            transform=ax.transAxes,
+            ha='center', fontsize=9, style='italic', color='gray'
+        )
 
     return fig
 
@@ -224,14 +236,14 @@ def main():
         traces,
         colliders,
         predictions,
-        title=f"Top View - {input_name}"
+        title=f"Top View (X-Z) - {input_name}"
     )
 
     fig_side = plot_side_view(
         traces,
         colliders,
         predictions,
-        title=f"Side View - {input_name}"
+        title=f"Side View (X-Y) - {input_name}"
     )
 
     # Save or show
@@ -242,6 +254,7 @@ def main():
         if args.side_output:
             fig_side.savefig(args.side_output, dpi=150, bbox_inches='tight')
             print(f"Saved side view to {args.side_output}")
+
     else:
         plt.show()
 
