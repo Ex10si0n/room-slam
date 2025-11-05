@@ -486,9 +486,9 @@ class TraceColliderDataset(Dataset):
     def _process_traces(self, traces: List[Dict]) -> torch.Tensor:
         """
         Convert raw trace list into a tensor of shape [N, 7]:
-          - (x, z, t)
-          - (vx, vz)
-          - (ax, az)
+          - (x, z, t)  # 2D position + time
+          - (vx, vz)   # 2D velocity
+          - (ax, az)   # 2D acceleration
           - speed (2D)
         """
         FEAT_DIM = 7
@@ -496,6 +496,7 @@ class TraceColliderDataset(Dataset):
         if len(traces) == 0:
             return torch.zeros((1, FEAT_DIM), dtype=torch.float32)
 
+        # Collect x, z, timestamp
         trace_list = []
         for p in traces:
             trace_list.append([
@@ -504,30 +505,38 @@ class TraceColliderDataset(Dataset):
                 p.get('timestamp', 0.0)
             ])
 
-        trace_array = np.array(trace_list, dtype=np.float32)
+        trace_array = np.array(trace_list, dtype=np.float32)  # [N, 3]
 
+        # Sort by timestamp
         if trace_array.shape[0] > 1:
-            order = np.argsort(trace_array[:, 2])
+            order = np.argsort(trace_array[:, 2])  # timestamp at index 2
             trace_array = trace_array[order]
 
+        # Normalize time
         if trace_array.shape[0] > 0:
             trace_array[:, 2] -= trace_array[0, 2]
 
-        # 2D speed and acceleration
-        diffs = np.diff(trace_array, axis=0, prepend=trace_array[[0], :])
-        dt = np.clip(diffs[:, 2], 1e-3, None)
+        # Compute 2D kinematics (only x, z)
+        diffs = np.diff(trace_array, axis=0, prepend=trace_array[[0], :])  # [N, 3]
+        dt = np.clip(diffs[:, 2], 1e-3, None)  # [N]
+
+        # Velocity: only x and z components
         vel = diffs[:, :2] / dt[:, None]  # [N, 2]
         vel = np.clip(vel, -10.0, 10.0)
 
-        vel_diffs = np.diff(vel, axis=0, prepend=vel[[0], :])
+        # Acceleration: derivative of velocity
+        vel_diffs = np.diff(vel, axis=0, prepend=vel[[0], :])  # [N, 2]
         acc = vel_diffs / dt[:, None]  # [N, 2]
         acc = np.clip(acc, -20.0, 20.0)
 
-        speed = np.linalg.norm(vel, axis=1, keepdims=True)  # [N, 1] - 2D speed
+        # 2D speed (magnitude of 2D velocity)
+        speed = np.linalg.norm(vel, axis=1, keepdims=True)  # [N, 1]
 
         kin = np.concatenate([vel, acc, speed], axis=1)  # [N, 5]
-        trace_array = np.concatenate([trace_array, kin], axis=1)  # [N, 7]
+        # Only keep x, z (not timestamp) + kinematics
+        trace_array = np.concatenate([trace_array[:, :2], kin], axis=1)  # [N, 2+5=7]
 
+        # Downsample if too long
         if len(trace_array) > self.max_trace_len:
             indices = np.linspace(0, len(trace_array) - 1, self.max_trace_len, dtype=int)
             trace_array = trace_array[indices]
