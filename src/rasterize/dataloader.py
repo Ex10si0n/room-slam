@@ -485,54 +485,54 @@ class TraceColliderDataset(Dataset):
 
     def _process_traces(self, traces: List[Dict]) -> torch.Tensor:
         """
-        Convert raw trace list into a tensor of shape [N, 11]:
-          - (x, y, z, t)
-          - (vx, vy, vz)
-          - (ax, ay, az)
-          - speed
+        Convert raw trace list into a tensor of shape [N, 7]:
+          - (x, z, t)
+          - (vx, vz)
+          - (ax, az)
+          - speed (2D)
         """
-        FEAT_DIM = 11
+        FEAT_DIM = 7
 
         if len(traces) == 0:
-            # Degenerate case: return a single all-zero row
             return torch.zeros((1, FEAT_DIM), dtype=torch.float32)
 
-        # Collect positions and timestamps into a matrix
         trace_list = []
         for p in traces:
             trace_list.append([
                 p.get('x', 0.0),
-                p.get('y', 0.0),
                 p.get('z', 0.0),
                 p.get('timestamp', 0.0)
             ])
 
         trace_array = np.array(trace_list, dtype=np.float32)
 
-        # Ensure strictly time-sorted by timestamp
-        order = np.argsort(trace_array[:, 3])
-        trace_array = trace_array[order]
+        if trace_array.shape[0] > 1:
+            order = np.argsort(trace_array[:, 2])
+            trace_array = trace_array[order]
 
-        # Normalize time to start at zero
         if trace_array.shape[0] > 0:
-            trace_array[:, 3] -= trace_array[0, 3]
+            trace_array[:, 2] -= trace_array[0, 2]
 
-        # Derive kinematic features: velocity, acceleration, speed
+        # 2D speed and acceleration
         diffs = np.diff(trace_array, axis=0, prepend=trace_array[[0], :])
-        dt = np.clip(diffs[:, 3], 1e-3, None)
-        vel = diffs[:, :3] / dt[:, None]                 # [N, 3]
-        acc = np.diff(vel, axis=0, prepend=vel[[0], :])  # [N, 3]
-        speed = np.linalg.norm(vel, axis=1, keepdims=True)  # [N, 1]
+        dt = np.clip(diffs[:, 2], 1e-3, None)
+        vel = diffs[:, :2] / dt[:, None]  # [N, 2]
+        vel = np.clip(vel, -10.0, 10.0)
 
-        kin = np.concatenate([vel, acc, speed], axis=1)  # [N, 7]
-        trace_array = np.concatenate([trace_array, kin], axis=1)  # [N, 11]
+        vel_diffs = np.diff(vel, axis=0, prepend=vel[[0], :])
+        acc = vel_diffs / dt[:, None]  # [N, 2]
+        acc = np.clip(acc, -20.0, 20.0)
 
-        # Optional downsampling when trace is too long
+        speed = np.linalg.norm(vel, axis=1, keepdims=True)  # [N, 1] - 2D speed
+
+        kin = np.concatenate([vel, acc, speed], axis=1)  # [N, 5]
+        trace_array = np.concatenate([trace_array, kin], axis=1)  # [N, 7]
+
         if len(trace_array) > self.max_trace_len:
             indices = np.linspace(0, len(trace_array) - 1, self.max_trace_len, dtype=int)
             trace_array = trace_array[indices]
 
-        return torch.from_numpy(trace_array)
+        return torch.from_numpy(trace_array.astype(np.float32))
 
     def _process_colliders(
             self,
@@ -542,12 +542,11 @@ class TraceColliderDataset(Dataset):
         Convert collider list into padded tensors.
 
         Returns:
-            boxes: [M, 6]  (cx, cy, cz, sx, sy, sz)
+            boxes: [M, 4]  (cx, cz, sx, sz) - 2D boxes
             labels: [M]    (class IDs, -1 for padding)
             valid_mask: [M] (True for valid colliders, False for padding)
         """
-        # Initialize with padding
-        boxes = torch.zeros((self.max_colliders, 6), dtype=torch.float32)
+        boxes = torch.zeros((self.max_colliders, 4), dtype=torch.float32)
         labels = torch.full((self.max_colliders,), -1, dtype=torch.long)
         valid_mask = torch.zeros(self.max_colliders, dtype=torch.bool)
 
@@ -561,17 +560,15 @@ class TraceColliderDataset(Dataset):
             size = col.get('size', {})
 
             cx = center.get('x', 0.0)
-            cy = center.get('y', 0.0)
             cz = center.get('z', 0.0)
 
             sx = size.get('x', 0.0)
-            sy = size.get('y', 0.0)
             sz = size.get('z', 0.0)
 
             label_str = col.get('label', 'BLOCK')
             label_id = self.label_to_id.get(label_str, 0)
 
-            boxes[i] = torch.tensor([cx, cy, cz, sx, sy, sz], dtype=torch.float32)
+            boxes[i] = torch.tensor([cx, cz, sx, sz], dtype=torch.float32)
             labels[i] = label_id
             valid_mask[i] = True
 

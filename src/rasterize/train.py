@@ -101,69 +101,61 @@ class TraceColliderAlignmentLoss(nn.Module):
 
     def compute_coverage_loss(
         self,
-        pred_boxes: torch.Tensor,
+        pred_boxes: torch.Tensor,   # [B, Q, 4]
         pred_classes: torch.Tensor,
-        traces: torch.Tensor,
+        traces: torch.Tensor,       # [B, N, 7]
         trace_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Encourage passable colliders to cover the trace."""
         B, Q, _ = pred_boxes.shape
         B, N, _ = traces.shape
 
-        trace_coords = traces[..., :3]      # [B, N, 3]
-        box_centers = pred_boxes[..., :3]   # [B, Q, 3]
-        box_sizes = pred_boxes[..., 3:]     # [B, Q, 3]
+        trace_coords = traces[..., :2]      # [B, N, 2] - x, z only
+        box_centers = pred_boxes[..., :2]   # [B, Q, 2]
+        box_sizes = pred_boxes[..., 2:]     # [B, Q, 2]
 
-        class_probs = F.softmax(pred_classes, dim=-1)  # [B, Q, 3]
-        # class 0=BLOCK, 1=LOW, 2=MID -> passable = LOW + MID
-        passable_probs = class_probs[..., 1:].sum(dim=-1)  # [B, Q]
+        class_probs = F.softmax(pred_classes, dim=-1)
+        passable_probs = class_probs[..., 1:].sum(dim=-1)
 
-        # Distance from points to boxes (soft outside distance)
-        diffs = trace_coords.unsqueeze(2) - box_centers.unsqueeze(1)  # [B, N, Q, 3]
+        diffs = trace_coords.unsqueeze(2) - box_centers.unsqueeze(1)  # [B, N, Q, 2]
         dists = diffs.abs()
         half_sizes = box_sizes.unsqueeze(1) / 2.0
-        inside_margin = F.relu(dists - half_sizes)        # [B, N, Q, 3]
-        point_to_box_dist = inside_margin.sum(dim=-1)     # [B, N, Q]
+        inside_margin = F.relu(dists - half_sizes)
+        point_to_box_dist = inside_margin.sum(dim=-1)  # [B, N, Q]
 
-        # Trace -> box coverage
-        weighted_dist_t2b = point_to_box_dist * passable_probs.unsqueeze(1)  # [B, N, Q]
-        min_dist_t2b, _ = weighted_dist_t2b.min(dim=-1)                      # [B, N]
+        weighted_dist_t2b = point_to_box_dist * passable_probs.unsqueeze(1)
+        min_dist_t2b, _ = weighted_dist_t2b.min(dim=-1)
         valid_dists_t2b = min_dist_t2b * trace_mask
         loss_t2b = valid_dists_t2b.sum() / (trace_mask.sum() + 1e-6)
 
-        # Box -> trace coverage
-        min_dist_b2t, _ = point_to_box_dist.min(dim=1)  # [B, Q]
+        min_dist_b2t, _ = point_to_box_dist.min(dim=1)
         weighted_dist_b2t = min_dist_b2t * passable_probs
         loss_b2t = weighted_dist_b2t.sum() / (passable_probs.sum() + 1e-6)
 
-        coverage_loss = loss_t2b + loss_b2t
-        return coverage_loss
+        return loss_t2b + loss_b2t
 
     def compute_avoidance_loss(
         self,
-        pred_boxes: torch.Tensor,
+        pred_boxes: torch.Tensor,   # [B, Q, 4]
         pred_classes: torch.Tensor,
-        traces: torch.Tensor,
+        traces: torch.Tensor,       # [B, N, 7]
         trace_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Penalize the trajectory going through BLOCK boxes."""
         B, Q, _ = pred_boxes.shape
         B, N, _ = traces.shape
 
-        trace_coords = traces[..., :3]      # [B, N, 3]
-        box_centers = pred_boxes[..., :3]   # [B, Q, 3]
-        box_sizes = pred_boxes[..., 3:]     # [B, Q, 3]
+        trace_coords = traces[..., :2]      # [B, N, 2]
+        box_centers = pred_boxes[..., :2]   # [B, Q, 2]
+        box_sizes = pred_boxes[..., 2:]     # [B, Q, 2]
 
-        class_probs = F.softmax(pred_classes, dim=-1)  # [B, Q, 3]
-        block_probs = class_probs[..., 0]              # [B, Q] probability of BLOCK
+        class_probs = F.softmax(pred_classes, dim=-1)
+        block_probs = class_probs[..., 0]
 
-        diffs = (trace_coords.unsqueeze(2) - box_centers.unsqueeze(1)).abs()  # [B, N, Q, 3]
+        diffs = (trace_coords.unsqueeze(2) - box_centers.unsqueeze(1)).abs()  # [B, N, Q, 2]
         half_sizes = box_sizes.unsqueeze(1) / 2.0
-        inside = (diffs < half_sizes).all(dim=-1).float()                     # [B, N, Q]
+        inside = (diffs < half_sizes).all(dim=-1).float()  # [B, N, Q]
 
-        # Trace inside BLOCK boxes
-        penetration = inside * block_probs.unsqueeze(1)                       # [B, N, Q]
-        total_penetration = penetration.sum(dim=-1)                           # [B, N]
+        penetration = inside * block_probs.unsqueeze(1)
+        total_penetration = penetration.sum(dim=-1)
 
         valid_penetration = total_penetration * trace_mask
         avoidance_loss = valid_penetration.sum() / (trace_mask.sum() + 1e-6)
@@ -188,30 +180,30 @@ class SetCriterion(nn.Module):
         )
 
     def box_iou_3d(self, boxes1, boxes2):
-        """Compute 3D GIoU between boxes."""
-        # boxes: [N, 6] (cx, cy, cz, sx, sy, sz)
+        """Compute 2D GIoU between boxes (now in x-z plane)."""
+        # boxes: [N, 4] (cx, cz, sx, sz)
 
-        boxes1_min = boxes1[:, :3] - boxes1[:, 3:] / 2
-        boxes1_max = boxes1[:, :3] + boxes1[:, 3:] / 2
-        boxes2_min = boxes2[:, :3] - boxes2[:, 3:] / 2
-        boxes2_max = boxes2[:, :3] + boxes2[:, 3:] / 2
+        boxes1_min = boxes1[:, :2] - boxes1[:, 2:] / 2  # [N, 2]
+        boxes1_max = boxes1[:, :2] + boxes1[:, 2:] / 2
+        boxes2_min = boxes2[:, :2] - boxes2[:, 2:] / 2
+        boxes2_max = boxes2[:, :2] + boxes2[:, 2:] / 2
 
         inter_min = torch.maximum(boxes1_min, boxes2_min)
         inter_max = torch.minimum(boxes1_max, boxes2_max)
         inter_size = torch.clamp(inter_max - inter_min, min=0)
-        inter_volume = inter_size.prod(dim=1)
+        inter_area = inter_size.prod(dim=1)  # 2D area
 
-        boxes1_volume = boxes1[:, 3:].prod(dim=1)
-        boxes2_volume = boxes2[:, 3:].prod(dim=1)
-        union_volume = boxes1_volume + boxes2_volume - inter_volume
-        iou = inter_volume / (union_volume + 1e-6)
+        boxes1_area = boxes1[:, 2:].prod(dim=1)
+        boxes2_area = boxes2[:, 2:].prod(dim=1)
+        union_area = boxes1_area + boxes2_area - inter_area
+        iou = inter_area / (union_area + 1e-6)
 
         enclosing_min = torch.minimum(boxes1_min, boxes2_min)
         enclosing_max = torch.maximum(boxes1_max, boxes2_max)
         enclosing_size = torch.clamp(enclosing_max - enclosing_min, min=0)
-        enclosing_volume = enclosing_size.prod(dim=1)
+        enclosing_area = enclosing_size.prod(dim=1)
 
-        giou = iou - (enclosing_volume - union_volume) / (enclosing_volume + 1e-6)
+        giou = iou - (enclosing_area - union_area) / (enclosing_area + 1e-6)
         return iou, giou
 
     def forward(self, outputs, targets, traces, trace_mask):
@@ -386,26 +378,13 @@ def validate(model, dataloader, criterion, device):
 
 
 def boxes_to_occupancy_grid(
-    boxes: torch.Tensor,
+    boxes: torch.Tensor,    # [K, 4] now
     grid_size: int,
     x_min: torch.Tensor,
     x_max: torch.Tensor,
     z_min: torch.Tensor,
     z_max: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Project a set of 3D boxes (cx, cy, cz, sx, sy, sz) onto a top-down occupancy grid.
-
-    We only use x/z dimensions to fill a [H, W] bool grid, where True = occupied.
-
-    Args:
-        boxes: [K, 6]
-        grid_size: grid side length, e.g., 64
-        x_min, x_max, z_min, z_max: scene bounds in X/Z plane
-
-    Returns:
-        grid: [H, W] bool tensor
-    """
     H = W = grid_size
     device = boxes.device
     grid = torch.zeros((H, W), dtype=torch.bool, device=device)
@@ -414,9 +393,9 @@ def boxes_to_occupancy_grid(
         return grid
 
     cx = boxes[:, 0]
-    cz = boxes[:, 2]
-    sx = boxes[:, 3].clamp_min(1e-6)
-    sz = boxes[:, 5].clamp_min(1e-6)
+    cz = boxes[:, 1]  # 索引改变
+    sx = boxes[:, 2].clamp_min(1e-6)
+    sz = boxes[:, 3].clamp_min(1e-6)
 
     x0 = cx - sx / 2.0
     x1 = cx + sx / 2.0
@@ -439,6 +418,7 @@ def boxes_to_occupancy_grid(
         grid[z_start:z_end + 1, x_start:x_end + 1] = True
 
     return grid
+
 
 
 @torch.no_grad()
@@ -500,18 +480,13 @@ def evaluate_grid_metrics(
             xs = []
             zs = []
             if trace_b.shape[0] > 0:
-                xs.append(trace_b[:, 0])
-                zs.append(trace_b[:, 2])
+                xs.append(trace_b[:, 0])  # x at index 0
+                zs.append(trace_b[:, 1])  # z at index 1 (not 2!)
             if gt_b.shape[0] > 0:
-                xs.append(gt_b[:, 0] - gt_b[:, 3] / 2.0)
-                xs.append(gt_b[:, 0] + gt_b[:, 3] / 2.0)
-                zs.append(gt_b[:, 2] - gt_b[:, 5] / 2.0)
-                zs.append(gt_b[:, 2] + gt_b[:, 5] / 2.0)
-            if pred_b.shape[0] > 0:
-                xs.append(pred_b[:, 0] - pred_b[:, 3] / 2.0)
-                xs.append(pred_b[:, 0] + pred_b[:, 3] / 2.0)
-                zs.append(pred_b[:, 2] - pred_b[:, 5] / 2.0)
-                zs.append(pred_b[:, 2] + pred_b[:, 5] / 2.0)
+                xs.append(gt_b[:, 0] - gt_b[:, 2] / 2.0)  # cx - sx/2
+                xs.append(gt_b[:, 0] + gt_b[:, 2] / 2.0)  # cx + sx/2
+                zs.append(gt_b[:, 1] - gt_b[:, 3] / 2.0)  # cz - sz/2
+                zs.append(gt_b[:, 1] + gt_b[:, 3] / 2.0)  # cz + sz/2
 
             if len(xs) == 0:
                 continue

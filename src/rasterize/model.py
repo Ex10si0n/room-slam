@@ -50,22 +50,11 @@ class PositionalEncoding(nn.Module):
 # Trace encoder (Transformer)
 # -----------------------------
 class TransformerTraceEncoder(nn.Module):
-    """
-    Transformer encoder for trace sequences.
-
-    Input:
-        traces: [B, T, 11]  (x,y,z,t + kinematic features)
-        mask:   [B, T]      (True for valid, False for padding)
-    Output:
-        memory: [B, T, D]   encoded features
-        coords: [B, T, 3]   original xyz coordinates
-        mean:   [B, 1, 3]   (currently zeros, kept for API compatibility)
-        scale:  [B, 1, 1]   (currently ones, kept for API compatibility)
-    """
+    """Input: traces: [B, T, 7] (x,z,t + 2D kinematics)"""
 
     def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 3):
         super().__init__()
-        self.input_proj = nn.Linear(11, d_model)
+        self.input_proj = nn.Linear(7, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -79,11 +68,9 @@ class TransformerTraceEncoder(nn.Module):
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
         B, N, _ = traces.shape
-        coords = traces[..., :3].contiguous()
+        coords = traces[..., :2].contiguous()  # [B, N, 2]
 
-        # For now we do not normalize coordinates (keep mean=0, scale=1),
-        # but keep the return values for compatibility with the decoder.
-        mean = torch.zeros(B, 1, 3, device=traces.device, dtype=traces.dtype)
+        mean = torch.zeros(B, 1, 2, device=traces.device, dtype=traces.dtype)  # 2D
         scale = torch.ones(B, 1, 1, device=traces.device, dtype=traces.dtype)
 
         x = self.input_proj(traces)
@@ -151,26 +138,16 @@ class MLP(nn.Module):
 
 
 class ColliderDecoder(nn.Module):
-    """
-    DETR-style transformer decoder which:
-
-    - Uses a set of learnable queries to predict colliders
-    - Attends over trace-encoded features
-    - Optionally conditions on a grid-level context vector
-    """
-
     def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 3, num_queries: int = 30):
         super().__init__()
         self.num_queries = num_queries
         self.query_embed = nn.Embedding(num_queries, d_model)
 
-        # Global context extracted from trace features
         self.context_query = nn.Parameter(torch.randn(1, 1, d_model))
         self.context_attn = nn.MultiheadAttention(d_model, num_heads=nhead, batch_first=True)
 
-        # Simple 3D spatial statistics of the trace
         self.spatial_proj = nn.Sequential(
-            nn.Linear(6, d_model),  # [mean(3) + std(3)]
+            nn.Linear(4, d_model),  # [mean(2) + std(2)]
             nn.ReLU(),
             nn.Linear(d_model, d_model)
         )
@@ -184,17 +161,15 @@ class ColliderDecoder(nn.Module):
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # Heads
-        self.center_delta_head = MLP(d_model, d_model, 3, 2)
-        self.size_head = MLP(d_model, d_model, 3, 2)
+        # 2D box heads
+        self.center_delta_head = MLP(d_model, d_model, 2, 2)
+        self.size_head = MLP(d_model, d_model, 2, 2)
         self.class_head = nn.Linear(d_model, 3)
 
-        # Extra projections for anchor computation
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.scale = d_model ** 0.5
 
-        # FiLM-style conditioning on global context (trace + grid)
         self.gamma_mlp = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -211,39 +186,29 @@ class ColliderDecoder(nn.Module):
     def forward(
             self,
             memory: torch.Tensor,
-            coords: torch.Tensor,
-            mean: torch.Tensor,
+            coords: torch.Tensor,    # [B, T, 2] - 2D coords
+            mean: torch.Tensor,      # [B, 1, 2]
             scale: torch.Tensor,
             memory_mask: Optional[torch.Tensor] = None,
             grid_context: Optional[torch.Tensor] = None
     ):
         """
-        Args:
-            memory:       [B, T, D] trace-encoded features
-            coords:       [B, T, 3] original xyz coordinates
-            mean:         [B, 1, 3] (currently zeros)
-            scale:        [B, 1, 1] (currently ones)
-            memory_mask:  [B, T] True = valid, False = padding
-            grid_context: [B, D] optional global context from grid encoder
-
         Returns:
-            boxes:   [B, Q, 6]  (cx, cy, cz, sx, sy, sz)
-            classes: [B, Q, 3]  class logits (BLOCK / LOW / MID)
+            boxes:   [B, Q, 4]  (cx, cz, sx, sz) - 2D boxes
+            classes: [B, Q, 3]
         """
         B, N, D = memory.shape
 
-        # Learnable base queries
-        base_queries = self.query_embed.weight.unsqueeze(0)  # [1, Q, D] -> [B, Q, D] later
+        base_queries = self.query_embed.weight.unsqueeze(0)
 
-        # Global context from trace features
         context_query = self.context_query.expand(B, -1, -1)
         key_padding_mask = ~memory_mask if memory_mask is not None else None
         global_context, _ = self.context_attn(
             context_query, memory, memory,
             key_padding_mask=key_padding_mask
-        )  # [B, 1, D]
+        )
 
-        # Compute simple spatial stats on coordinates
+        # 2D spatial stats
         if memory_mask is not None:
             valid_coords = coords * memory_mask.unsqueeze(-1)
             denom = memory_mask.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
@@ -255,54 +220,47 @@ class ColliderDecoder(nn.Module):
             coord_mean = coords.mean(dim=1, keepdim=True)
             coord_std = coords.std(dim=1, keepdim=True)
 
-        spatial_stats = torch.cat([coord_mean, coord_std], dim=-1)  # [B, 1, 6]
-        spatial_feat = self.spatial_proj(spatial_stats)             # [B, 1, D]
+        spatial_stats = torch.cat([coord_mean, coord_std], dim=-1)  # [B, 1, 4]
+        spatial_feat = self.spatial_proj(spatial_stats)
 
-        # Combine trace-global, spatial, and grid context
-        combined_context = global_context + spatial_feat  # [B, 1, D]
+        combined_context = global_context + spatial_feat
         if grid_context is not None:
             combined_context = combined_context + grid_context.unsqueeze(1)
 
-        # FiLM conditioning of query embeddings
-        gamma = self.gamma_mlp(combined_context)  # [B, 1, D]
-        beta = self.beta_mlp(combined_context)   # [B, 1, D]
-        queries = base_queries * (1.0 + gamma) + beta  # [B, Q, D]
+        gamma = self.gamma_mlp(combined_context)
+        beta = self.beta_mlp(combined_context)
+        queries = base_queries * (1.0 + gamma) + beta
 
-        # Transformer decoder over trace memory
         mem_pad_mask = ~memory_mask if memory_mask is not None else None
         decoded = self.transformer(
             queries,
             memory,
             memory_key_padding_mask=mem_pad_mask
-        )  # [B, Q, D]
+        )
 
-        # Attention back to coordinates to get an anchor position per query
-        q = self.q_proj(decoded)  # [B, Q, D]
-        k = self.k_proj(memory)   # [B, T, D]
-        attn_scores = torch.einsum('bqd,bnd->bqn', q, k) / self.scale  # [B, Q, T]
+        q = self.q_proj(decoded)
+        k = self.k_proj(memory)
+        attn_scores = torch.einsum('bqd,bnd->bqn', q, k) / self.scale
 
         if memory_mask is not None:
             pad = ~memory_mask
             attn_scores = attn_scores.masked_fill(pad.unsqueeze(1), float('-inf'))
 
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, Q, T]
+        attn_weights = torch.softmax(attn_scores, dim=-1)
 
-        # Normalize coordinates with mean/scale before computing anchor
         norm_coords = (coords - mean) / scale
-        anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, norm_coords)  # [B, Q, 3]
+        anchor_pos = torch.einsum('bqn,bnd->bqd', attn_weights, norm_coords)  # [B, Q, 2]
 
-        # Box regression heads
-        delta_center = self.center_delta_head(decoded)       # [B, Q, 3]
-        size_raw = self.size_head(decoded)                  # [B, Q, 3]
-        size_norm = F.softplus(size_raw) + 1e-4             # ensure positive sizes
+        delta_center = self.center_delta_head(decoded)  # [B, Q, 2]
+        size_raw = self.size_head(decoded)              # [B, Q, 2]
+        size_norm = F.softplus(size_raw) + 1e-4
 
-        center = (anchor_pos + delta_center) * scale + mean # [B, Q, 3]
-        size = size_norm * scale                            # [B, Q, 3]
+        center = (anchor_pos + delta_center) * scale + mean  # [B, Q, 2]
+        size = size_norm * scale                              # [B, Q, 2]
 
-        boxes = torch.cat([center, size], dim=-1)           # [B, Q, 6]
-        classes = self.class_head(decoded)                  # [B, Q, 3]
+        boxes = torch.cat([center, size], dim=-1)  # [B, Q, 4]
+        classes = self.class_head(decoded)
         return boxes, classes
-
 
 # Full model: Trace + Grid -> Colliders
 class TraceToColliderTransformer(nn.Module):
@@ -339,31 +297,23 @@ class TraceToColliderTransformer(nn.Module):
 
     def forward(
         self,
-        traces: torch.Tensor,
+        traces: torch.Tensor,      # [B, T, 7]
         mask: Optional[torch.Tensor] = None,
         grid_maps: Optional[torch.Tensor] = None
     ):
         """
-        Args:
-            traces:    [B, T, 11] trace features from dataloader
-            mask:      [B, T] True = valid, False = padding
-            grid_maps: [B, 1, H, W] Walk2Map-style inverse-distance maps
-
         Returns:
             dict with:
-              - 'pred_boxes':   [B, Q, 6]
+              - 'pred_boxes':   [B, Q, 4]  (cx, cz, sx, sz)
               - 'pred_classes': [B, Q, 3]
         """
-        # Encode traces
         memory, coords, mean, scale = self.encoder(traces, mask)
 
-        # Encode grid maps (2D context)
         if grid_maps is not None:
-            grid_context = self.grid_encoder(grid_maps)  # [B, D]
+            grid_context = self.grid_encoder(grid_maps)
         else:
             grid_context = None
 
-        # Decode colliders from combined context
         boxes, classes = self.decoder(
             memory, coords, mean, scale,
             memory_mask=mask,
