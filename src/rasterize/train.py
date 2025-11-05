@@ -622,7 +622,6 @@ def main():
         scale_range=(0.8, 1.2),
         translation_range=1.0,
         collider_dropout_prob=args.dropout_prob,
-        use_baseline_colliders=False  # no baseline colliders in the simplified setup
     )
 
     val_loader = create_dataloader(
@@ -633,7 +632,6 @@ def main():
         augment_translation=False,
         augment_scale=False,
         augment_collider_dropout=False,
-        use_baseline_colliders=False
     )
 
     # Model: transformer-only trace+grid
