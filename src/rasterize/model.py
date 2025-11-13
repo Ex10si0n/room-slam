@@ -68,10 +68,17 @@ class TransformerTraceEncoder(nn.Module):
 
     def forward(self, traces: torch.Tensor, mask: Optional[torch.Tensor] = None):
         B, N, _ = traces.shape
-        coords = traces[..., :2].contiguous()  # [B, N, 2]
+        coords = traces[..., :2].contiguous()  # [B, N, 2] - 2D coords (x, z)
 
-        mean = torch.zeros(B, 1, 2, device=traces.device, dtype=traces.dtype)  # 2D
-        scale = torch.ones(B, 1, 1, device=traces.device, dtype=traces.dtype)
+        # Compute trace-specific mean and scale for normalization (2D version)
+        # This ensures model learns relative positions, not absolute coordinates
+        valid = mask if mask is not None else torch.ones((B, N), dtype=torch.bool, device=traces.device)
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(-1)
+
+        mean = (coords * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # [B, 1, 2]
+        centered = (coords - mean) * valid.unsqueeze(-1)
+        rms = torch.sqrt((centered ** 2).sum(dim=(1, 2), keepdim=True) / denom[..., :1]).clamp_min(1e-3)
+        scale = rms  # [B, 1, 1]
 
         x = self.input_proj(traces)
         x = self.pos_encoder(x)

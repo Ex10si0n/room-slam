@@ -238,9 +238,20 @@ class SetCriterion(nn.Module):
         losses['avoidance_loss'] = alignment_losses['avoidance']
 
         # Diversity regularization: encourage predictions to be trace-dependent
+        # Penalize when predictions are too similar across different traces in the batch
         if pred_boxes.shape[0] > 1:
-            pred_var = pred_boxes.var(dim=0).mean()
-            diversity_loss = -0.01 * pred_var.clamp(max=1.0)
+            # 1. Box variance across batch
+            box_var = pred_boxes.var(dim=0).mean()
+
+            # 2. Class prediction variance
+            class_probs = F.softmax(pred_classes, dim=-1)
+            class_var = class_probs.var(dim=0).mean()
+
+            # 3. Penalize if variance is TOO LOW (encourage trace-dependent predictions)
+            # We want high variance, so we penalize when variance < threshold
+            target_box_variance = 0.5  # Target minimum variance for boxes
+            target_class_variance = 0.3  # Target minimum variance for classes
+            diversity_loss = F.relu(target_box_variance - box_var) + F.relu(target_class_variance - class_var)
             losses['diversity_loss'] = diversity_loss
         else:
             losses['diversity_loss'] = torch.tensor(0.0, device=pred_boxes.device)
@@ -619,14 +630,14 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {num_params:,}")
 
-    # Loss weights
+    # Loss weights (adjusted to encourage trace-dependent predictions)
     weight_dict = {
         'class_loss': 2.0,
         'l1_loss': 5.0,
         'giou_loss': 2.0,
         'coverage_loss': args.cov_weight,
         'avoidance_loss': args.avoid_weight,
-        'diversity_loss': 0.1
+        'diversity_loss': 1.0  # Increased from 0.1 to 1.0 to strongly encourage trace-dependent predictions
     }
     print(f"Using loss weights: {weight_dict}")
     criterion = SetCriterion(weight_dict)
