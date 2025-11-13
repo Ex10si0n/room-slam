@@ -140,6 +140,10 @@ class TraceColliderAlignmentLoss(nn.Module):
         traces: torch.Tensor,       # [B, N, 7]
         trace_mask: torch.Tensor
     ) -> torch.Tensor:
+        """
+        Strongly penalize BLOCK predictions that overlap with traces.
+        Uses hard constraints for high-confidence BLOCK predictions.
+        """
         B, Q, _ = pred_boxes.shape
         B, N, _ = traces.shape
 
@@ -148,17 +152,31 @@ class TraceColliderAlignmentLoss(nn.Module):
         box_sizes = pred_boxes[..., 2:]     # [B, Q, 2]
 
         class_probs = F.softmax(pred_classes, dim=-1)
-        block_probs = class_probs[..., 0]
+        block_probs = class_probs[..., 0]   # [B, Q]
+
+        # Add safety margin to BLOCK boxes (expand by 0.2m on each side)
+        safety_margin = 0.2
+        expanded_half_sizes = (box_sizes.unsqueeze(1) + safety_margin) / 2.0  # [B, 1, Q, 2]
 
         diffs = (trace_coords.unsqueeze(2) - box_centers.unsqueeze(1)).abs()  # [B, N, Q, 2]
-        half_sizes = box_sizes.unsqueeze(1) / 2.0
-        inside = (diffs < half_sizes).all(dim=-1).float()  # [B, N, Q]
+        inside_expanded = (diffs < expanded_half_sizes).all(dim=-1).float()  # [B, N, Q]
 
-        penetration = inside * block_probs.unsqueeze(1)
-        total_penetration = penetration.sum(dim=-1)
+        # Hard constraint: For high-confidence BLOCK predictions (>0.5), use squared penalty
+        high_confidence_block = (block_probs > 0.5).float()  # [B, Q]
+        low_confidence_block = (block_probs <= 0.5).float()  # [B, Q]
 
-        valid_penetration = total_penetration * trace_mask
-        avoidance_loss = valid_penetration.sum() / (trace_mask.sum() + 1e-6)
+        # Hard penalty for high-confidence BLOCK overlaps
+        hard_penetration = inside_expanded * high_confidence_block.unsqueeze(1)  # [B, N, Q]
+        hard_loss = (hard_penetration.sum(dim=-1) ** 2) * trace_mask  # Square to make it stronger
+        hard_loss = hard_loss.sum() / (trace_mask.sum() + 1e-6)
+
+        # Soft penalty for low-confidence BLOCK overlaps (weighted by probability)
+        soft_penetration = inside_expanded * block_probs.unsqueeze(1) * low_confidence_block.unsqueeze(1)
+        soft_loss = soft_penetration.sum(dim=-1) * trace_mask
+        soft_loss = soft_loss.sum() / (trace_mask.sum() + 1e-6)
+
+        # Total avoidance loss (hard penalty is much stronger)
+        avoidance_loss = hard_loss * 10.0 + soft_loss
 
         return avoidance_loss
 
@@ -556,8 +574,8 @@ def main():
                         help="Collider dropout probability in data augmentation")
     parser.add_argument('--cov_weight', type=float, default=0.5,
                         help="Weight for coverage_loss")
-    parser.add_argument('--avoid_weight', type=float, default=1.0,
-                        help="Weight for avoidance_loss")
+    parser.add_argument('--avoid_weight', type=float, default=10.0,
+                        help="Weight for avoidance_loss (critical: people cannot walk through BLOCK areas)")
     parser.add_argument('--lr', type=float, default=1e-4,
                         help="Learning rate")
     parser.add_argument('--num_epochs', type=int, default=200,
