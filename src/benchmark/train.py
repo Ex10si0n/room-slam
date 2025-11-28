@@ -231,6 +231,45 @@ class SetCriterion(nn.Module):
 
         return iou, giou
 
+
+    def compute_collision_loss(self, pred_boxes):
+        """Compute pairwise 3D IoU collision loss to penalize overlaps"""
+        B, Q = pred_boxes.shape[:2]
+        if Q <= 1:
+            return torch.tensor(0.0, device=pred_boxes.device)
+            
+        loss = 0.0
+        for b in range(B):
+            boxes = pred_boxes[b] # [Q, 6]
+            
+            # [Q, 1, 3]
+            min_b = (boxes[:, :3] - boxes[:, 3:] / 2).unsqueeze(1)
+            max_b = (boxes[:, :3] + boxes[:, 3:] / 2).unsqueeze(1)
+            
+            # [1, Q, 3]
+            min_b_t = (boxes[:, :3] - boxes[:, 3:] / 2).unsqueeze(0)
+            max_b_t = (boxes[:, :3] + boxes[:, 3:] / 2).unsqueeze(0)
+            
+            inter_min = torch.max(min_b, min_b_t)
+            inter_max = torch.min(max_b, max_b_t)
+            inter_dims = torch.clamp(inter_max - inter_min, min=0)
+            inter_vol = inter_dims.prod(dim=-1) # [Q, Q]
+            
+            vol = boxes[:, 3:].prod(dim=-1) # [Q]
+            union_vol = vol.unsqueeze(1) + vol.unsqueeze(0) - inter_vol
+            
+            iou = inter_vol / (union_vol + 1e-6)
+            
+            # Zero out diagonal (self-overlap)
+            mask = torch.eye(Q, device=boxes.device).bool()
+            iou = iou.masked_fill(mask, 0.0)
+            
+            # Average overlapping IoU
+            if Q > 1:
+                loss += iou.sum() / (Q * (Q - 1))
+            
+        return loss / B
+
     def forward(self, outputs, targets, traces, trace_mask):
         pred_boxes = outputs['pred_boxes']
         pred_classes = outputs['pred_classes']
@@ -256,6 +295,7 @@ class SetCriterion(nn.Module):
         alignment_losses = self.alignment_loss(pred_boxes, pred_classes, traces, trace_mask)
         losses['coverage_loss'] = alignment_losses['coverage']
         losses['avoidance_loss'] = alignment_losses['avoidance']
+        losses['collision_loss'] = self.compute_collision_loss(pred_boxes)
 
         # Diversity regularization: encourage predictions to be trace-dependent
         # Penalize predictions that are too uniform across batch
@@ -377,6 +417,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
             'giou': f"{losses['giou_loss'].item():.4f}",
             'cov': f"{losses['coverage_loss'].item():.4f}",
             'avoid': f"{losses['avoidance_loss'].item():.4f}",
+            'col': f"{losses['collision_loss'].item():.4f}",
             'div': f"{losses['diversity_loss'].item():.4f}"
         })
 
@@ -619,8 +660,10 @@ def main():
                         help="Collider dropout probability")
     parser.add_argument('--cov_weight', type=float, default=0.5,
                         help="Weight for coverage_loss")
-    parser.add_argument('--avoid_weight', type=float, default=1.0,
+    parser.add_argument('--avoid_weight', type=float, default=5.0,
                         help="Weight for avoidance_loss")
+    parser.add_argument('--collision_weight', type=float, default=10.0,
+                        help="Weight for collision_loss")
     parser.add_argument('--lr', type=float, default=1e-4,
                         help="Learning rate")
     parser.add_argument('--num_epochs', type=int, default=200,
@@ -643,15 +686,15 @@ def main():
         'num_epochs': args.num_epochs,
         'lr': args.lr,
         'weight_decay': 1e-4,
-        'd_model': 128,
+        'd_model': 256,
         'num_queries': 30,
         'data_dir': '../../dataset/train',
         'val_dir': '../../dataset/val',
         'save_dir': f'./checkpoints_{args.stage_name}',
         'val_every': 1,
         'iou_thresh': 0.5,
-        'use_baseline_colliders': True,
-        'baseline_encoder_layers': 2
+        'use_baseline_colliders': False,
+        'baseline_encoder_layers': 4
     }
 
     # Create save directory
@@ -678,7 +721,7 @@ def main():
         scale_range=(0.8, 1.2),
         translation_range=1.0,
         collider_dropout_prob=args.dropout_prob,
-        use_baseline_colliders=True
+        use_baseline_colliders=False
     )
 
     val_loader = create_dataloader(
@@ -689,7 +732,7 @@ def main():
         augment_translation=False,
         augment_scale=False,
         augment_collider_dropout=False,
-        use_baseline_colliders=True
+        use_baseline_colliders=False
     )
 
     # Build model
@@ -697,8 +740,8 @@ def main():
         num_queries=config['num_queries'],
         d_model=config['d_model'],
         model_type=config.get('model_type', 'transformer'),
-        use_baseline_colliders=True,
-        baseline_encoder_layers=2
+        use_baseline_colliders=False,
+        baseline_encoder_layers=4
     ).to(device)
 
     # Count parameters
@@ -706,11 +749,12 @@ def main():
     print(f"Model parameters: {num_params:,}")
 
     weight_dict = {
-        'class_loss': 2.0,
-        'l1_loss': 5.0,
-        'giou_loss': 2.0,
+        'class_loss': 5.0,
+        'l1_loss': 10.0,
+        'giou_loss': 5.0,
         'coverage_loss': args.cov_weight,
         'avoidance_loss': args.avoid_weight,
+        'collision_loss': args.collision_weight,
         'diversity_loss': 0.1  # Small weight for diversity regularization
     }
     print(f"Using weights: {weight_dict}")
@@ -726,7 +770,7 @@ def main():
     if args.load_checkpoint:
         print(f"\nLoading weights from: {args.load_checkpoint}\n")
         checkpoint = torch.load(args.load_checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
         # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         # start_epoch = checkpoint['epoch'] + 1

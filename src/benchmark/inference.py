@@ -19,7 +19,7 @@ def load_model(checkpoint_path: str, device):
         d_model=config.get('d_model', 256),
         model_type=config.get('model_type', 'transformer'),
         use_baseline_colliders=config.get('use_baseline_colliders', True),
-        baseline_encoder_layers=config.get('baseline_encoder_layers', 2)
+        baseline_encoder_layers=config.get('baseline_encoder_layers', 4)
     )
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
