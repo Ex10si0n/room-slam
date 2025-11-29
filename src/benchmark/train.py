@@ -22,6 +22,29 @@ class HungarianMatcher:
         self.cost_box = cost_box
 
     @torch.no_grad()
+
+    def compute_collision_loss(self, pred_boxes):
+        B, Q = pred_boxes.shape[:2]
+        if Q <= 1: return torch.tensor(0.0, device=pred_boxes.device)
+        loss = 0.0
+        for b in range(B):
+            boxes = pred_boxes[b]
+            min_b = (boxes[:, :3] - boxes[:, 3:] / 2).unsqueeze(1)
+            max_b = (boxes[:, :3] + boxes[:, 3:] / 2).unsqueeze(1)
+            min_b_t = (boxes[:, :3] - boxes[:, 3:] / 2).unsqueeze(0)
+            max_b_t = (boxes[:, :3] + boxes[:, 3:] / 2).unsqueeze(0)
+            inter_min = torch.max(min_b, min_b_t)
+            inter_max = torch.min(max_b, max_b_t)
+            inter_dims = torch.clamp(inter_max - inter_min, min=0)
+            inter_vol = inter_dims.prod(dim=-1)
+            vol = boxes[:, 3:].prod(dim=-1)
+            union_vol = vol.unsqueeze(1) + vol.unsqueeze(0) - inter_vol
+            iou = inter_vol / (union_vol + 1e-6)
+            mask = torch.eye(Q, device=boxes.device).bool()
+            iou = iou.masked_fill(mask, 0.0)
+            loss += iou.sum() / (Q * (Q - 1))
+        return loss / B
+
     def forward(self, pred_boxes, pred_classes, gt_boxes, gt_labels, gt_valid_mask):
         """
         pred_boxes: [B, Q, 6]
@@ -56,7 +79,7 @@ class HungarianMatcher:
             cost = self.cost_class * cost_class + self.cost_box * cost_box
 
             # Hungarian matching
-            cost = cost.cpu().numpy()
+            cost = cost.detach().cpu().numpy()
             pred_idx, gt_idx = linear_sum_assignment(cost)
 
             indices.append((pred_idx, gt_idx))
@@ -231,6 +254,71 @@ class SetCriterion(nn.Module):
 
         return iou, giou
 
+
+    def compute_alignment_loss(self, pred_boxes):
+        """
+        Compute alignment loss to encourage collinearity/orthogonality.
+        Penalize min(dx^2, dz^2) for pairs of boxes.
+        """
+        B, Q, _ = pred_boxes.shape
+        if Q <= 1:
+            return torch.tensor(0.0, device=pred_boxes.device)
+
+        loss = 0.0
+        for b in range(B):
+            boxes = pred_boxes[b] # [Q, 6]
+            centers = boxes[:, :3] # [Q, 3] (cx, cy, cz)
+            
+            # Pairwise differences
+            # [Q, 1, 3] - [1, Q, 3] -> [Q, Q, 3]
+            diff = centers.unsqueeze(1) - centers.unsqueeze(0)
+            dx2 = diff[..., 0] ** 2
+            dz2 = diff[..., 2] ** 2
+            dist2 = dx2 + diff[..., 1]**2 + dz2
+            
+            # Alignment penalty: minimize min(dx^2, dz^2)
+            # This encourages objects to be aligned along X or Z axis relative to each other
+            alignment_error = torch.min(dx2, dz2)
+            
+            # Weight by proximity (Gaussian kernel on distance)
+            # Sigma controls the range of interaction (e.g., 2.0 meters)
+            sigma = 2.0
+            weights = torch.exp(-dist2 / (2 * sigma**2))
+            
+            # Zero out diagonal (self-interaction)
+            mask = ~torch.eye(Q, device=boxes.device).bool()
+            
+            # Compute weighted alignment loss
+            weighted_error = alignment_error * weights
+            
+            # Sum valid pairs and normalize
+            loss += weighted_error[mask].sum() / (Q * (Q - 1) + 1e-6)
+
+        return loss / B
+
+
+    def compute_collision_loss(self, pred_boxes):
+        B, Q = pred_boxes.shape[:2]
+        if Q <= 1: return torch.tensor(0.0, device=pred_boxes.device)
+        loss = 0.0
+        for b in range(B):
+            boxes = pred_boxes[b]
+            min_b = (boxes[:, :3] - boxes[:, 3:] / 2).unsqueeze(1)
+            max_b = (boxes[:, :3] + boxes[:, 3:] / 2).unsqueeze(1)
+            min_b_t = (boxes[:, :3] - boxes[:, 3:] / 2).unsqueeze(0)
+            max_b_t = (boxes[:, :3] + boxes[:, 3:] / 2).unsqueeze(0)
+            inter_min = torch.max(min_b, min_b_t)
+            inter_max = torch.min(max_b, max_b_t)
+            inter_dims = torch.clamp(inter_max - inter_min, min=0)
+            inter_vol = inter_dims.prod(dim=-1)
+            vol = boxes[:, 3:].prod(dim=-1)
+            union_vol = vol.unsqueeze(1) + vol.unsqueeze(0) - inter_vol
+            iou = inter_vol / (union_vol + 1e-6)
+            mask = torch.eye(Q, device=boxes.device).bool()
+            iou = iou.masked_fill(mask, 0.0)
+            loss += iou.sum() / (Q * (Q - 1))
+        return loss / B
+
     def forward(self, outputs, targets, traces, trace_mask):
         pred_boxes = outputs['pred_boxes']
         pred_classes = outputs['pred_classes']
@@ -256,6 +344,7 @@ class SetCriterion(nn.Module):
         alignment_losses = self.alignment_loss(pred_boxes, pred_classes, traces, trace_mask)
         losses['coverage_loss'] = alignment_losses['coverage']
         losses['avoidance_loss'] = alignment_losses['avoidance']
+        losses['collision_loss'] = self.compute_collision_loss(pred_boxes)
 
         # Diversity regularization: encourage predictions to be trace-dependent
         # Penalize predictions that are too uniform across batch
@@ -268,6 +357,8 @@ class SetCriterion(nn.Module):
             losses['diversity_loss'] = diversity_loss
         else:
             losses['diversity_loss'] = torch.tensor(0.0, device=pred_boxes.device)
+
+        losses['alignment_loss'] = self.compute_alignment_loss(pred_boxes)
 
         # Total loss
         total_loss = sum(losses[k] * self.weight_dict.get(k, 1.0) for k in losses.keys())
@@ -371,12 +462,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         # Log
         total_loss += loss.item()
         pbar.set_postfix({
+            'align': f"{losses['alignment_loss'].item():.4f}",
             'loss': f"{loss.item():.4f}",
             'cls': f"{losses['class_loss'].item():.4f}",
             'l1': f"{losses['l1_loss'].item():.4f}",
             'giou': f"{losses['giou_loss'].item():.4f}",
             'cov': f"{losses['coverage_loss'].item():.4f}",
             'avoid': f"{losses['avoidance_loss'].item():.4f}",
+            'col': f"{losses['collision_loss'].item():.4f}",
             'div': f"{losses['diversity_loss'].item():.4f}"
         })
 
@@ -621,8 +714,10 @@ def main():
                         help="Weight for coverage_loss")
     parser.add_argument('--avoid_weight', type=float, default=1.0,
                         help="Weight for avoidance_loss")
+    parser.add_argument('--collision_weight', type=float, default=0.0, help="Weight for collision_loss")
     parser.add_argument('--lr', type=float, default=1e-4,
                         help="Learning rate")
+    parser.add_argument('--alignment_weight', type=float, default=1.0, help="Weight for alignment_loss")
     parser.add_argument('--num_epochs', type=int, default=200,
                         help="Number of epochs to train")
 
@@ -706,11 +801,13 @@ def main():
     print(f"Model parameters: {num_params:,}")
 
     weight_dict = {
-        'class_loss': 2.0,
-        'l1_loss': 5.0,
-        'giou_loss': 2.0,
+        'alignment_loss': args.alignment_weight,
+        'class_loss': 10.0,
+        'l1_loss': 10.0,
+        'giou_loss': 5.0,
         'coverage_loss': args.cov_weight,
         'avoidance_loss': args.avoid_weight,
+        'collision_loss': args.collision_weight,
         'diversity_loss': 0.1  # Small weight for diversity regularization
     }
     print(f"Using weights: {weight_dict}")
